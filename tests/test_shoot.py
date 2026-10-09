@@ -68,7 +68,7 @@ class ShootCLITests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_missing_option_value(self):
-        for option in ("--out", "--size", "--states", "--param", "--zoom", "--steps", "--hold", "--wait"):
+        for option in ("--out", "--size", "--states", "--param", "--zoom", "--steps", "--hold", "--wait", "--compare"):
             for following in ((), ("--force",)):
                 with self.subTest(option=option, following=following):
                     result = subprocess.run([NODE, str(SCRIPT), option, *following], cwd=ROOT,
@@ -149,6 +149,7 @@ document.querySelector('#go').onclick = () => show(document.body.dataset.state =
         report = json.loads((output / "report.json").read_text(encoding="utf-8"))
         self.assertEqual([entry["state"] for entry in report], ["a", "b"])
         self.assertEqual([entry["issues"] for entry in report], [[], []])
+        self.assertEqual([entry["lint"] for entry in report], [[], []])
         self.assertNotEqual((output / "a.png").read_bytes(), (output / "b.png").read_bytes())
         self.assertNotEqual((output / "a.png").read_bytes(), (output / "a-masked.png").read_bytes())
         self.assertEqual(list(self.profile_root.glob("oil-shoot-*")), [], "Temporary browser profiles leaked")
@@ -360,6 +361,75 @@ h1{margin:40px;height:300px;background:#1e3a8a;animation:rise .3s ease-out both}
                 for expected in ("shoot-test-error", "shoot-test-exception", "横向溢出", "图片没加载出来"):
                     self.assertIn(expected, issues)
 
+
+    def test_lint_flags_default_patterns(self):
+        self.page.write_text('''<!doctype html><html lang="zh"><head><meta charset="utf-8"><link rel="icon" href="data:,"><style>
+body{margin:0;padding:40px;font:16px/1.7 sans-serif;color:#222;background:#fff}
+.eyebrow{font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin:0}
+h1{font-size:48px;margin:0 0 24px;background:linear-gradient(90deg,#7c3aed,#06b6d4);background-clip:text;-webkit-background-clip:text;color:transparent}
+.num{font-size:12px;margin:0}h2{font-size:28px;margin:4px 0 24px}
+.card{border:1px solid #ddd;border-radius:16px;padding:24px;margin:16px 0}
+.quote{border-left:4px solid #e11d48;padding:12px 16px}.low{color:#c8c8c8}
+.dense{font-size:11px;line-height:1.2;width:600px}.ghost{opacity:0}
+</style></head><body><p class="eyebrow">Smart Ledger</p><h1>让记账更简单</h1>
+<p class="num">01 / 账户</p><h2>所有账户一目了然</h2>
+<div class="card">外层<div class="card">里层卡片里有一些文字</div></div>
+<div class="quote">好的工具让人忘记它的存在。</div><p class="low">很淡的说明文字，颜色几乎看不见。</p>
+<p class="dense">这是一段很长的正文，用了很小的字号和很紧的行高，一行特别长，读的时候眼睛要跑很远才能换行，这是一段很长的正文，用了很小的字号和很紧的行高，一行特别长，读的时候眼睛要跑很远才能换行。</p>
+<ul><li><span>🚀</span> 快</li><li><span>💰</span> 省</li></ul><div><span>WORKSPACE OVERVIEW</span> <span>CONTENT OBJECT</span></div>
+<p class="ghost">这一段一直停在透明状态</p>
+<p>这一页的中文足够多，用来判断这是中文界面。这一页的中文足够多，用来判断这是中文界面。这一页的中文足够多，用来判断这是中文界面。</p>
+</body></html>''', encoding="utf-8")
+        output = self.folder / "lint"
+        result = self.shoot(output, "--size", "1440x900")
+        entry = json.loads((output / "report.json").read_text(encoding="utf-8"))[0]
+        self.assertEqual(entry["issues"], [])
+        rules = {item["rule"] for item in entry["lint"]}
+        for rule in ("eyebrow", "numbered", "gradientText", "sideStripe", "nestedCards", "emojiIcon",
+                     "englishLabel", "contrastLow", "smallText", "tightLeading", "longMeasure", "stuck"):
+            self.assertIn(rule, rules)
+        self.assertIn("默认做法提示", result.stdout)
+
+    def test_lint_requires_body_contrast_of_4_5(self):
+        self.page.write_text('''<!doctype html><html><head><link rel="icon" href="data:,"><style>
+body{margin:0;padding:40px;font:16px/1.6 sans-serif;color:#222;background:#fff}
+.soft{color:#8a8a8a}
+</style></head><body><p class="soft">Body text at about 3.5 to 1 contrast still fails the 4.5 to 1 floor.</p></body></html>''', encoding="utf-8")
+        output = self.folder / "soft"
+        self.shoot(output, "--size", "1280x800")
+        lint = json.loads((output / "report.json").read_text(encoding="utf-8"))[0]["lint"]
+        self.assertIn("contrastLow", {item["rule"] for item in lint})
+
+    def test_lint_spares_css_triangles_and_neutral_dividers(self):
+        self.page.write_text('''<!doctype html><html><head><link rel="icon" href="data:,"><style>
+body{margin:0;padding:40px;font:16px/1.6 sans-serif;color:#222}
+.play{width:0;height:0;border-top:12px solid transparent;border-bottom:12px solid transparent;border-left:20px solid #e11d48}
+aside{border-right:1px solid #ddd;height:200px;width:200px}
+@keyframes rise{from{opacity:0}to{opacity:1}}h1{animation:rise .6s ease-out both;font-size:40px;margin:48px 0 12px}
+</style></head><body><span class="play"></span><aside>Sidebar</aside><p>Intro paragraph above the heading.</p>
+<h1>Plain heading</h1><p>Body text that follows the heading closely.</p></body></html>''', encoding="utf-8")
+        output = self.folder / "clean"
+        self.shoot(output, "--size", "1280x800")
+        self.assertEqual(json.loads((output / "report.json").read_text(encoding="utf-8"))[0]["lint"], [])
+
+    def test_compare_against_reference(self):
+        reference = self.folder / "reference"
+        self.shoot(reference, "--states", "a", "--size", "800x600")
+        same = self.folder / "same"
+        self.shoot(same, "--states", "a", "--size", "800x600", "--compare", str(reference / "a.png"))
+        entry = json.loads((same / "report.json").read_text(encoding="utf-8"))[0]
+        self.assert_artifacts(same, ("a-compare.png",))
+        self.assertLess(entry["compare"]["overall"], 1)
+        other = self.folder / "other"
+        result = self.shoot(other, "--states", "b", "--size", "800x600", "--compare", str(reference / "a.png"))
+        entry = json.loads((other / "report.json").read_text(encoding="utf-8"))[0]
+        self.assertGreater(entry["compare"]["overall"], 20)
+        self.assertEqual(len(entry["compare"]["cells"]), 9)
+        self.assertIn("差异明显的像素占", result.stdout)
+        missing = subprocess.run([NODE, str(SCRIPT), str(self.page), "--compare", str(self.folder / "nope.png")],
+                                 cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("找不到参考图", missing.stderr)
 
     def test_reports_blank_webgl_canvas(self):
         # 同一块画布已经拿了 2d 上下文，再要 webgl 必然失败，用它模拟“截图成功但画布是空的”

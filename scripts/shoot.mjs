@@ -32,9 +32,14 @@ const HELP = `用法：node shoot.mjs <页面地址或文件> [选项]
                         有没有动画、幅度多大，没有或太小记为问题；首屏滚动
                         1.5 屏内几层在变只作报告，供选了首屏景深的页面核对；
                         页面本身不能滚动时（单屏 App）跳过滚动检查
+  --compare <参考图>    截图还原用：每张截图和参考图（png、jpg、webp）出一张对比图，
+                        参考、当前、叠加、差异热图四格，并按九宫格报告差异像素占比；
+                        参考图按宽度缩放到截图宽度，用 --size 设成参考的逻辑尺寸
   --wait <毫秒>         页面加载后等多久再截，默认 400
 
-每张图都会检查控制台错误、横向溢出和加载失败的图片，结果写进 report.json。`;
+每张图都会检查控制台错误、横向溢出和加载失败的图片，结果写进 report.json；
+另外查一组模型默认做法和可读性问题（眉标、彩色单侧边线、卡片套卡片、对比度等），
+写进 report.json 的 lint 字段。`;
 
 const args = process.argv.slice(2);
 if (!args.length || args.includes("--help") || args.includes("-h")) {
@@ -68,6 +73,10 @@ const states = opt.states ? opt.states.split(",").map((s) => s.trim()).filter(Bo
 const stateIds = states.map((s, i) => !s ? "page" : /^[A-Za-z0-9_-]{1,80}$/.test(s) ? s :
   `state-${i + 1}-${createHash("sha256").update(s).digest("hex").slice(0, 12)}`);
 const zoom = Number(opt.zoom) || 1;
+const refImage = opt.compare ? resolve(opt.compare) : null;
+if (refImage && !existsSync(refImage)) fail(`找不到参考图：${opt.compare}`);
+if (refImage && !/\.(png|jpe?g|webp)$/i.test(refImage)) fail("--compare 只接受 png、jpg 或 webp");
+if (refImage && flags.has("record")) fail("--compare 用在截图上，不和 --record 一起用");
 const out = resolve(opt.out);
 mkdirSync(out, { recursive: true });
 
@@ -279,6 +288,250 @@ async function check() {
   return [...problems, ...found];
 }
 
+// ---------- 默认做法提示：模型默认审美和可读性里能机械判断的几项 ----------
+// 在页面里运行，不能引用外层变量。只报不拦：命中的改掉，或在交付说明里写出理由。
+function lintPage() {
+  const LABELS = {
+    eyebrow: "标题上方的眉标", numbered: "标题上方的编号标签", sideStripe: "彩色单侧边线",
+    gradientText: "渐变文字", nestedCards: "卡片里套卡片", emojiIcon: "表情符号当图标",
+    englishLabel: "中文界面里的英文大写标签", contrastLow: "文字对比度不达标（正文低于 4.5:1，大字低于 3:1）", grayOnColor: "有色底上的灰字",
+    smallText: "正文小于 13px", tightLeading: "多行正文行高过紧", longMeasure: "正文行太长",
+    stuck: "首屏有内容停在透明状态（出场动画没触发？）", headingSpacing: "标题离上文比离下文还近",
+  };
+  const found = new Map();
+  const describe = (el) => {
+    const cls = typeof el.className === "string" && el.className.trim() ? "." + el.className.trim().split(/\s+/).slice(0, 2).join(".") : "";
+    const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 24);
+    return el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + cls + (text ? "「" + text + "」" : "");
+  };
+  const add = (rule, el, note) => {
+    let r = found.get(rule);
+    if (!r) found.set(rule, r = { rule, label: LABELS[rule], count: 0, examples: [] });
+    r.count++;
+    if (r.examples.length < 3) r.examples.push(describe(el) + (note ? "（" + note + "）" : ""));
+  };
+  const css = (el, pseudo) => getComputedStyle(el, pseudo);
+  const shown = (el) => {
+    const r = el.getBoundingClientRect(), s = css(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
+  };
+  // 颜色统一画到画布上再读回，oklch、color-mix 这类写法也能比较。
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const colors = new Map();
+  const rgba = (value) => {
+    if (!ctx || !value) return { r: 0, g: 0, b: 0, a: 0 };
+    if (colors.has(value)) return colors.get(value);
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillStyle = "rgba(0,0,0,0)";
+    ctx.fillStyle = value;
+    ctx.fillRect(0, 0, 1, 1);
+    const d = ctx.getImageData(0, 0, 1, 1).data;
+    const c = { r: d[0], g: d[1], b: d[2], a: d[3] / 255 };
+    colors.set(value, c);
+    return c;
+  };
+  const luminance = ({ r, g, b }) => {
+    const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+  };
+  const ratio = (a, b) => { const x = luminance(a), y = luminance(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+  const chroma = ({ r, g, b }) => (Math.max(r, g, b) - Math.min(r, g, b)) / 255;
+  const over = (top, bottom) => ({
+    r: top.r * top.a + bottom.r * (1 - top.a), g: top.g * top.a + bottom.g * (1 - top.a),
+    b: top.b * top.a + bottom.b * (1 - top.a), a: 1,
+  });
+  const media = [...document.querySelectorAll("img,video,canvas,picture,iframe,svg image")]
+    .filter(shown).map((m) => m.getBoundingClientRect()).filter((r) => r.width * r.height > 2000);
+  const overMedia = (r) => media.some((m) => {
+    const w = Math.min(r.right, m.right) - Math.max(r.left, m.left), h = Math.min(r.bottom, m.bottom) - Math.max(r.top, m.top);
+    return w > 0 && h > 0 && w * h > r.width * r.height * 0.3;
+  });
+  // 文字背后的底色：沿祖先往上叠，遇到背景图、渐变或媒体就算不知道。
+  const backdrop = (el) => {
+    const layers = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      const s = css(node);
+      if (s.backgroundImage !== "none") return null;
+      const c = rgba(s.backgroundColor);
+      if (c.a > 0) { layers.push(c); if (c.a >= 0.99) break; }
+    }
+    return layers.reverse().reduce((base, c) => over(c, base), { r: 255, g: 255, b: 255, a: 1 });
+  };
+  const ownText = (el) => [...el.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join("").trim();
+  const all = [...document.body.querySelectorAll("*")].slice(0, 8000)
+    .filter((el) => !el.closest("svg,script,style,noscript,template,head,[aria-hidden='true'],#oil-mark"));
+  const texts = all.filter((el) => ownText(el).length >= 2 && shown(el));
+  const cjkCount = (document.body.innerText.match(/[一-鿿]/g) || []).length;
+  const latinCount = (document.body.innerText.match(/[A-Za-z]/g) || []).length;
+  const chinese = cjkCount > 120 && cjkCount > latinCount / 2;
+
+  // 眉标与编号标签：紧贴在标题正上方、比标题小很多的一行短字
+  const flaggedAbove = new Set();
+  const headings = [...document.querySelectorAll("h1,h2,h3")].filter(shown);
+  for (const h of headings) {
+    const hs = parseFloat(css(h).fontSize);
+    if (hs < 20) continue;
+    let prev = h.previousElementSibling, node = h;
+    while (!prev && node.parentElement && node.parentElement !== document.body) { node = node.parentElement; prev = node.previousElementSibling; }
+    if (!prev || !shown(prev) || prev.closest("nav,[aria-label*='readcrumb' i],[class*='breadcrumb' i]")) continue;
+    if (prev.querySelector("a,button,input,select,textarea,img,video,canvas") || /^(A|BUTTON|INPUT|IMG)$/.test(prev.tagName)) continue;
+    const text = (prev.innerText || "").trim();
+    if (!text || text.length > 48 || text.includes("\n")) continue;
+    let holder = prev;
+    while (!ownText(holder) && holder.children.length === 1) holder = holder.children[0];
+    const s = css(holder), size = parseFloat(s.fontSize);
+    if (size > 16 || size > hs * 0.6) continue;
+    const pr = prev.getBoundingClientRect(), hr = h.getBoundingClientRect();
+    if (pr.bottom > hr.top + 4 || hr.top - pr.bottom > Math.max(32, hs * 1.2) || pr.right < hr.left || pr.left > hr.right) continue;
+    const caps = s.textTransform === "uppercase" || (/[A-Z]{3}/.test(text) && text === text.toUpperCase());
+    const tracked = parseFloat(s.letterSpacing) / size >= 0.05;
+    const mono = /mono|courier|consolas|menlo/i.test(s.fontFamily);
+    const ps = css(prev);
+    const pill = parseFloat(ps.borderTopLeftRadius) >= pr.height / 3 && (rgba(ps.backgroundColor).a > 0.1 || parseFloat(ps.borderTopWidth) >= 1);
+    const numbered = /^0\d$/.test(text) || /^(?:0?\d{1,2}|[IVX]{1,4})(?:\s*[\/·—–|]\s*|[.:]\s+)\S/.test(text);
+    if (numbered) { add("numbered", prev); flaggedAbove.add(h); }
+    else if (caps || tracked || mono || pill) { add("eyebrow", prev); flaggedAbove.add(h); }
+  }
+
+  // 标题离下文应比离上文近：标题属于它后面的内容
+  for (const h of headings) {
+    if (flaggedAbove.has(h)) continue;
+    const parent = css(h.parentElement);
+    if (parent.display.includes("grid") || (parent.display.includes("flex") && !parent.flexDirection.startsWith("column"))) continue;
+    let prev = h.previousElementSibling, next = h.nextElementSibling;
+    while (prev && !shown(prev)) prev = prev.previousElementSibling;
+    while (next && !shown(next)) next = next.nextElementSibling;
+    if (!prev || !next) continue;
+    const hr = h.getBoundingClientRect();
+    const above = hr.top - prev.getBoundingClientRect().bottom, below = next.getBoundingClientRect().top - hr.bottom;
+    if (above >= 0 && below >= 12 && above + 4 < below) add("headingSpacing", h, "上 " + Math.round(above) + "px，下 " + Math.round(below) + "px");
+  }
+
+  for (const el of all) {
+    const s = css(el);
+    if (s.display === "none") continue;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) continue;
+
+    // 单侧彩色边线：边框或贴边的伪元素，中性色的结构分隔线不算
+    const sides = { left: parseFloat(s.borderLeftWidth), right: parseFloat(s.borderRightWidth), top: parseFloat(s.borderTopWidth), bottom: parseFloat(s.borderBottomWidth) };
+    for (const side of ["left", "right"]) {
+      const w = sides[side], others = Math.max(sides[side === "left" ? "right" : "left"], sides.top, sides.bottom);
+      const c = rgba(s[side === "left" ? "borderLeftColor" : "borderRightColor"]);
+      if (w >= 2 && w >= others * 2 && /solid|double/.test(s[side === "left" ? "borderLeftStyle" : "borderRightStyle"])
+        && c.a >= 0.4 && chroma(c) >= 0.15 && r.height >= 16 && r.width > sides.left + sides.right + 24 && r.height < innerHeight * 0.8) add("sideStripe", el, w + "px");
+    }
+    for (const pseudo of ["::before", "::after"]) {
+      const p = css(el, pseudo);
+      if (p.content === "none" || p.position !== "absolute") continue;
+      const pw = parseFloat(p.width), ph = parseFloat(p.height), c = rgba(p.backgroundColor);
+      if (pw >= 2 && pw <= 8 && ph >= r.height * 0.6 && r.height >= 24 && r.width > 60 && c.a >= 0.4 && chroma(c) >= 0.15
+        && (parseFloat(p.left) <= 2 || parseFloat(p.right) <= 2)) add("sideStripe", el, pseudo);
+    }
+
+    if (/text/.test(s.backgroundClip + " " + s.getPropertyValue("-webkit-background-clip")) && /gradient/.test(s.backgroundImage) && (el.textContent || "").trim()) add("gradientText", el);
+  }
+
+  // 卡片里套卡片：有边框或阴影的圆角块，放在另一个圆角块里
+  const card = (el, inner) => {
+    const s = css(el), r = el.getBoundingClientRect();
+    if (r.width < 120 || r.height < 56 || /^(BUTTON|A|INPUT|SELECT|TEXTAREA|IMG|VIDEO|CANVAS|LABEL|SUMMARY|PRE|CODE)$/.test(el.tagName)) return false;
+    if (parseFloat(s.borderTopLeftRadius) < 6) return false;
+    const border = ["Top", "Right", "Bottom", "Left"].every((k) => parseFloat(s["border" + k + "Width"]) >= 1 && rgba(s["border" + k + "Color"]).a > 0.05);
+    const shadow = s.boxShadow !== "none";
+    const fill = rgba(s.backgroundColor).a > 0.05;
+    if (inner) return border || (shadow && fill);
+    return (border || shadow || fill) && r.width * r.height < innerWidth * innerHeight * 0.6;
+  };
+  for (const el of all) {
+    if (!card(el, true)) continue;
+    for (let up = el.parentElement, depth = 0; up && up !== document.body && depth < 8; up = up.parentElement, depth++) {
+      if (card(up, false)) { add("nestedCards", el, "外层 " + describe(up).split("「")[0]); break; }
+    }
+  }
+
+  const emoji = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}️)(?:‍\p{Extended_Pictographic}️?)*$/u;
+  const emojiHits = texts.filter((el) => emoji.test(ownText(el)) && !el.closest("p,blockquote,li > p"));
+  if (emojiHits.length >= 2) emojiHits.forEach((el) => add("emojiIcon", el));
+
+  if (chinese) {
+    const labels = texts.filter((el) => {
+      const t = (el.innerText || "").trim();
+      if (!t || t.length > 40 || /[一-鿿]/.test(t) || el.closest("code,pre,kbd,samp")) return false;
+      const letters = (t.match(/[A-Za-z]/g) || []).length;
+      const upper = css(el).textTransform === "uppercase" || (/[A-Z]{2}/.test(t) && t === t.toUpperCase());
+      return upper && (letters >= 8 || /[A-Za-z]{2,}\s+[A-Za-z]{2,}/.test(t));
+    });
+    if (labels.length >= 2) labels.forEach((el) => add("englishLabel", el));
+  }
+
+  for (const el of texts) {
+    const s = css(el), r = el.getBoundingClientRect();
+    if (el.closest("button:disabled,[disabled],[aria-disabled='true'],input,textarea,select,option")) continue;
+    const size = parseFloat(s.fontSize);
+    let alpha = 1;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) alpha *= parseFloat(css(node).opacity);
+    const bg = overMedia(r) ? null : backdrop(el);
+    const fg = rgba(s.color);
+    if (bg && alpha > 0.05 && fg.a > 0) {
+      const color = over({ ...fg, a: fg.a * alpha }, bg);
+      const contrast = ratio(color, bg);
+      const large = size >= 24 || (size >= 18.6 && parseInt(s.fontWeight, 10) >= 700);
+      // 低于 1.5:1 时文字几乎看不见，多半是文字后面还垫着一层查不到的元素（滑块、绝对定位的底板），不报
+      if (contrast < 1.5) continue;
+      if (contrast < (large ? 3 : 4.5)) add("contrastLow", el, contrast.toFixed(2) + ":1");
+      else if (chroma(bg) >= 0.25 && chroma(color) < 0.06 && luminance(color) > 0.08 && luminance(color) < 0.6) add("grayOnColor", el);
+    }
+    // 正文：两行以上的段落
+    const text = ownText(el);
+    const zh = /[一-鿿]/.test(text);
+    if (text.length < (zh ? 30 : 60) || el.closest("code,pre,table,nav,button,label,figcaption,kbd")) continue;
+    const lh = s.lineHeight === "normal" ? size * 1.2 : parseFloat(s.lineHeight);
+    if (r.height < lh * 1.8) continue;
+    if (size < 12.5) add("smallText", el, size + "px");
+    if (lh / size < (zh ? 1.4 : 1.3)) add("tightLeading", el, (lh / size).toFixed(2));
+    const perLine = zh ? r.width / size : r.width / (size * 0.5);
+    if (perLine > (zh ? 46 : 95)) add("longMeasure", el, "每行约 " + Math.round(perLine) + (zh ? " 字" : " 个字符"));
+  }
+
+  // 首屏里停在透明的内容：出场动画没触发时截图会缺一块
+  for (const el of all) {
+    const r = el.getBoundingClientRect();
+    if (r.top >= innerHeight || r.bottom <= 0 || r.width < 40 || r.height < 16) continue;
+    if (!(ownText(el).length >= 4 || (el.tagName === "IMG" && el.complete))) continue;
+    if (el.closest("[role='dialog'],[role='tooltip'],[role='menu'],[hidden],dialog:not([open]),details:not([open])")) continue;
+    let alpha = 1, hider = null;
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      const o = parseFloat(css(node).opacity);
+      if (o < 0.5 && !hider) hider = node;
+      alpha *= o;
+    }
+    if (alpha >= 0.05 || !hider) continue;
+    const hs = css(hider);
+    if (/absolute|fixed/.test(hs.position) || hs.pointerEvents === "none" || css(el).visibility === "hidden") continue;
+    add("stuck", el);
+  }
+
+  return [...found.values()];
+}
+
+async function lint() {
+  // 等一次性的动画播完，免得把正在淡入的内容当成停住了
+  await evaluate(`(() => {
+    const running = document.getAnimations ? document.getAnimations().filter((a) => a.playState === "running" && a.timeline === document.timeline
+      && a.effect && a.effect.getTiming && a.effect.getTiming().iterations !== Infinity) : [];
+    return Promise.race([Promise.all(running.map((a) => a.finished.catch(() => {}))), new Promise((ok) => setTimeout(ok, 2500))]).then(() => true);
+  })()`);
+  try {
+    return await evaluate(`(${lintPage.toString()})()`);
+  } catch (error) {
+    return [{ rule: "lintError", label: "默认做法检查没跑完", count: 1, examples: [error.message.slice(0, 160)] }];
+  }
+}
+const lintLine = (items) => items.map((i) => `${i.label} ${i.count} 处（${i.examples.join("，")}）`).join("；");
+
 async function screenshot(file, full) {
   let clip;
   if (full) {
@@ -387,6 +640,65 @@ figcaption{margin-top:10px}</style><main>${figures}</main>`;
   await setViewport(width, Math.round((cell * h) / w) + 120, 1);
   await open(`file://${tmp}`);
   return screenshot(file, true);
+}
+
+// ---------- 对比图：截图还原时和参考图并排、叠加、出差异热图 ----------
+const IMAGE_TYPES = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+const CELLS = ["左上", "中上", "右上", "左中", "正中", "右中", "左下", "中下", "右下"];
+async function compare(buildPath, refPath, file) {
+  const ref = `data:${IMAGE_TYPES[extname(refPath).toLowerCase()]};base64,${readFileSync(refPath).toString("base64")}`;
+  const build = `data:image/png;base64,${readFileSync(buildPath).toString("base64")}`;
+  const html = `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<style>body{margin:0;padding:28px;background:#ececea;font:13px -apple-system,"PingFang SC",sans-serif;color:#555}
+main{display:grid;grid-template-columns:repeat(2,720px);gap:24px 20px;align-items:start}figure{margin:0}
+canvas{width:100%;display:block;border-radius:8px;box-shadow:0 1px 3px #0002;background:#fff}figcaption{margin-top:8px}</style>
+<main><figure><canvas id="ref"></canvas><figcaption>参考</figcaption></figure><figure><canvas id="build"></canvas><figcaption>当前</figcaption></figure>
+<figure><canvas id="overlay"></canvas><figcaption>叠加（当前 50% 盖在参考上）</figcaption></figure><figure><canvas id="diff"></canvas><figcaption id="note">差异</figcaption></figure></main>
+<script>(async () => {
+  const load = (src) => new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => no(new Error("参考图打不开")); i.src = src; });
+  const [ref, build] = await Promise.all([load(${JSON.stringify(ref)}), load(${JSON.stringify(build)})]);
+  const W = build.naturalWidth, refH = Math.round(ref.naturalHeight * W / ref.naturalWidth), H = Math.min(refH, build.naturalHeight);
+  const paint = (id, fn) => { const c = document.getElementById(id); c.width = W; c.height = H; const x = c.getContext("2d"); fn(x); return x; };
+  paint("ref", (x) => x.drawImage(ref, 0, 0, W, refH));
+  paint("build", (x) => x.drawImage(build, 0, 0));
+  paint("overlay", (x) => { x.drawImage(ref, 0, 0, W, refH); x.globalAlpha = 0.5; x.drawImage(build, 0, 0); });
+  // 缩到 480 宽再逐像素比颜色：任一通道差超过 0.1 算“有差异”，忽略抗锯齿和一两像素的错位
+  const sw = 480, sh = Math.max(1, Math.round(H * sw / W));
+  const sample = (img) => { const c = document.createElement("canvas"); c.width = sw; c.height = sh; const x = c.getContext("2d", { willReadFrequently: true });
+    const k = img.naturalWidth / W; x.drawImage(img, 0, 0, img.naturalWidth, H * k, 0, 0, sw, sh); return x.getImageData(0, 0, sw, sh).data; };
+  const a = sample(ref), b = sample(build);
+  const lum = (d, i) => (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+  const heat = new ImageData(sw, sh), sums = Array(9).fill(0), counts = Array(9).fill(0);
+  let total = 0;
+  for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+    const i = (y * sw + x) * 4, d = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2])) / 255, cell = Math.min(2, Math.floor(y * 3 / sh)) * 3 + Math.min(2, Math.floor(x * 3 / sw));
+    const hit = d > 0.1 ? 1 : 0;
+    total += hit; sums[cell] += hit; counts[cell]++;
+    const g = lum(b, i) * 255 * 0.35 + 150;
+    heat.data[i] = hit ? 225 : g; heat.data[i + 1] = hit ? 40 : g; heat.data[i + 2] = hit ? 60 : g; heat.data[i + 3] = 255;
+  }
+  const small = document.createElement("canvas"); small.width = sw; small.height = sh; small.getContext("2d").putImageData(heat, 0, 0);
+  const cells = sums.map((s, i) => +(100 * s / Math.max(1, counts[i])).toFixed(1));
+  paint("diff", (x) => {
+    x.drawImage(small, 0, 0, W, H);
+    x.strokeStyle = "#0006"; x.lineWidth = Math.max(1, W / 420); x.fillStyle = "#111"; x.font = "600 " + Math.round(W / 22) + "px -apple-system,sans-serif";
+    for (let i = 0; i < 9; i++) { const cx = (i % 3) * W / 3, cy = Math.floor(i / 3) * H / 3; x.strokeRect(cx, cy, W / 3, H / 3); x.fillText(cells[i] + "%", cx + W / 60, cy + W / 18); }
+  });
+  window.__compare = { overall: +(100 * total / (sw * sh)).toFixed(1), cells, refHeight: refH, buildHeight: build.naturalHeight };
+})().catch((e) => { window.__compare = { error: e.message }; });</script>`;
+  const tmp = join(profile, "compare.html");
+  writeFileSync(tmp, html);
+  await setViewport(2 * 720 + 20 + 56, 900, 1);
+  await open(`file://${tmp}`);
+  let result = null;
+  for (let i = 0; i < 50 && !result; i++) { result = await evaluate(`window.__compare || null`); if (!result) await sleep(100); }
+  if (!result || result.error) throw new Error(`对比图没做出来：${result?.error || "超时"}`);
+  await screenshot(file, true);
+  const worst = result.cells.map((v, i) => ({ v, i })).sort((x, y) => y.v - x.v).slice(0, 3).map(({ v, i }) => `${CELLS[i]} ${v}%`);
+  const gap = Math.abs(result.refHeight - result.buildHeight) / result.buildHeight > 0.05
+    ? `；参考图按宽度缩放后高 ${result.refHeight}px，截图高 ${result.buildHeight}px，只比了重叠部分` : "";
+  return { file: basename(file), overall: result.overall, cells: Object.fromEntries(CELLS.map((c, i) => [c, result.cells[i]])),
+    message: `${basename(file)}：差异明显的像素占 ${result.overall}%，最多的格子 ${worst.join("、")}${gap}` };
 }
 
 // ---------- 录屏 ----------
@@ -593,9 +905,11 @@ try {
         const name = [stateIds[stateIndex], sizes.length > 1 ? `${w}x${h}` : "", zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean).join("-");
         const file = await screenshot(join(out, `${name}.png`), flags.has("full"));
         const issues = await check();
-        report.push({ file: basename(file), state: s, size: `${w}x${h}`, zoom, issues });
+        const hints = await lint();
+        const entry = { file: basename(file), state: s, size: `${w}x${h}`, zoom, issues, lint: hints };
+        report.push(entry);
         shots.push({ path: file, label: s || "page" });
-        lines.push(`${basename(file)}${issues.length ? "  ⚠ " + issues.join("；") : ""}`);
+        lines.push(`${basename(file)}${issues.length ? "  ⚠ " + issues.join("；") : ""}${hints.length ? "  ◇ 默认做法提示：" + lintLine(hints) : ""}`);
         if (marks.length) {
           await mark();
           lines.push(basename(await screenshot(join(out, `${name}-marked.png`), flags.has("full"))));
@@ -605,6 +919,11 @@ try {
           await mask();
           await sleep(60);
           masked.push({ path: await screenshot(join(out, `${name}-masked.png`), flags.has("full")), label: s || "page" });
+        }
+        if (refImage) {
+          const result = await compare(file, refImage, join(out, `${name}-compare.png`));
+          entry.compare = { file: result.file, overall: result.overall, cells: result.cells };
+          lines.push(result.message);
         }
       }
       if (flags.has("sheet") && shots.length > 1) {
@@ -623,6 +942,8 @@ console.log(`输出目录：${out}`);
 for (const l of lines) console.log(`- ${l}`);
 const total = report.reduce((n, r) => n + r.issues.length, 0);
 if (report.length) console.log(total ? `发现 ${total} 个问题，详见 report.json` : `检查通过：没有控制台错误、横向溢出或加载失败的图片${flags.has("motion") ? "，三段动效都检测到了" : ""}`);
+const hinted = [...new Set(report.flatMap((r) => (r.lint || []).map((i) => i.label)))];
+if (hinted.length) console.log(`默认做法提示 ${hinted.length} 类：${hinted.join("、")}。可读性几项（对比度不达标、正文小于 13px、行高过紧、停在透明）要改；其余改掉，或在交付说明里写出它怎样服务方向，误报也写一句。详见 report.json 的 lint`);
 ws.close();
 await cleanup();
 process.exit(process.exitCode || 0);
