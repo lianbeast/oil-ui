@@ -44,6 +44,11 @@ class ShootCLITests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("用法", result.stdout)
+        self.assertIn("type 在当前光标处插入文字", result.stdout)
+        self.assertIn("fill 先清空原内容", result.stdout)
+        self.assertNotIn("fill=type", result.stdout)
+        self.assertIn("不进入 iframe 或 Shadow DOM", result.stdout)
+        self.assertIn("中心点遮挡和禁用状态", result.stdout)
 
     def test_missing_target(self):
         result = subprocess.run([NODE, str(SCRIPT)], cwd=ROOT,
@@ -61,10 +66,9 @@ class ShootCLITests(unittest.TestCase):
                 result = subprocess.run([NODE, str(SCRIPT), *args], cwd=ROOT,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 1)
-                self.assertEqual(result.stderr.splitlines(), [
-                    "shoot：不认识的选项 --xxx",
-                    "可用选项：" + " ".join(options),
-                ])
+                self.assertIn("不认识的选项 --xxx", result.stderr)
+                self.assertIn("是不是想写", result.stderr)
+                self.assertIn("可用选项：" + " ".join(options), result.stderr)
                 self.assertEqual(result.stdout, "")
 
     def test_missing_option_value(self):
@@ -82,15 +86,137 @@ class ShootCLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stderr, "shoot：缺少页面地址或文件。\n")
 
+    def dry(self, *args, ok=True):
+        result = subprocess.run([NODE, str(SCRIPT), "page.html", "--dry-run", *args],
+                                cwd=ROOT, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0 if ok else 1, result.stdout + result.stderr)
+        return json.loads(result.stdout) if ok else result.stderr
+
+    def test_dry_run_corpus_regressions(self):
+        # Twenty corpus patterns; project-specific classes, labels and text are neutralized.
+        cases = [
+            ('click "[data-thread=sample]"', "click", "[data-thread=sample]"),
+            ('click [data-id="sample"]', "click", '[data-id="sample"]'),
+            ('click \'.cause [data-latest-release]\'', "click", '.cause [data-latest-release]'),
+            ('click .nav button[data-view=sample]', "click", '.nav button[data-view=sample]'),
+            ('click [aria-label="Send money"]', "click", '[aria-label="Send money"]'),
+            ('click "[aria-label=\\"Send money\\"]"', "click", '[aria-label="Send money"]'),
+            ('click \'[aria-label="Start Sample task"]\'', "click", '[aria-label="Start Sample task"]'),
+            ('click ".nav button:nth-child(3)"', "click", '.nav button:nth-child(3)'),
+            ('hover "[data-message=sample] .reaction"', "hover", '[data-message=sample] .reaction'),
+            ('drag "[data-tile=\\"1\\"] .tile-paper" 240 0', "drag", '[data-tile="1"] .tile-paper'),
+            ('drag [data-id="sample"] 214 -350', "drag", '[data-id="sample"]'),
+            ('drag ".sample-line:nth-child(2)" 45 0', "drag", '.sample-line:nth-child(2)'),
+            ('type #message-input 示例内容', "type", '#message-input'),
+            ('type [aria-label="Message box"] 你好', "type", '[aria-label="Message box"]'),
+            ('type "#search" Sample', "type", '#search'),
+            ('click text=More', "click", 'More'),
+            ('click button:has-text("Undo")', "click", 'Undo'),
+            ('wait450', "wait", None),
+            ('key ControlOrMeta+A', "key", None),
+            ('key Meta+r', "key", None),
+        ]
+        for raw, action, selector in cases:
+            with self.subTest(raw=raw):
+                step = self.dry("--steps", raw)["groups"][0]["steps"][0]
+                self.assertEqual(step["action"], action)
+                if selector is not None:
+                    self.assertEqual(step["selector"]["value"], selector)
+
+    def test_dry_run_balanced_steps_and_parameters(self):
+        parsed = self.dry("--steps", 'open: click [data-label="a;b"]; click :is([data-label="a;b"]); '
+                          'type ".form input" "hello; world"; select #choice "Second item"; '
+                          'wait450; wait 450ms; wait 0.5s; key Shift+Tab',
+                          "--steps", 'click :has-text(\'Undo; action\')', "--mark", '1=text="a;b"')
+        steps = parsed["groups"][0]["steps"]
+        self.assertEqual(parsed["groups"][0]["name"], "open")
+        self.assertEqual(len(steps), 8)
+        self.assertEqual(steps[2]["params"], {"text": "hello; world"})
+        self.assertEqual(steps[3]["params"], {"value": "Second item"})
+        self.assertEqual([s["params"]["ms"] for s in steps[4:7]], [450, 450, 500])
+        self.assertEqual(parsed["groups"][1]["name"], None)
+        self.assertEqual(parsed["marks"][0]["selector"]["kind"], "text")
+        for raw, expected in [('type #input "text [without a closing bracket"', 'text [without a closing bracket'),
+                              ("type #input don't stop", "don't stop"),
+                              ('type "body [aria-label="Message box"]" "hello world"', 'hello world')]:
+            self.assertEqual(self.dry("--steps", raw)["groups"][0]["steps"][0]["params"]["text"], expected)
+        for raw, action in [('doubleclick .a', 'dblclick'), ('press Control+A', 'key'),
+                            ('fill #input "hello"', 'fill'), ('sleep 0.5s', 'wait'), ('waitfor text=Ready', 'waitfor')]:
+            self.assertEqual(self.dry("--steps=" + raw)["groups"][0]["steps"][0]["action"], action)
+
+    def test_fill_parses_as_replacement_action(self):
+        for raw, kind, value, text in [
+            ('fill ".form input" "hello world"', 'css', '.form input', 'hello world'),
+            ('fill [aria-label="Message box"] ""', 'css', '[aria-label="Message box"]', ''),
+            ('fill text="Old message" new', 'text', 'Old message', 'new'),
+            ("fill textarea:has-text('Old message') new", 'has-text', 'Old message', 'new'),
+        ]:
+            with self.subTest(raw=raw):
+                step = self.dry('--steps', raw)['groups'][0]['steps'][0]
+                self.assertEqual(step['action'], 'fill')
+                self.assertEqual(step['selector']['kind'], kind)
+                self.assertEqual(step['selector']['value'], value)
+                self.assertEqual(step['params'], {'text': text})
+        self.assertIn('例如 fill #field "hello world"', self.dry('--steps', 'fill #field', ok=False))
+
+    def test_dry_run_does_not_launch_or_write_and_shares_errors(self):
+        with tempfile.TemporaryDirectory(prefix="oil-shoot-dry-") as folder:
+            output = Path(folder) / "never-created"
+            env = dict(os.environ, CHROME_PATH=str(Path(folder) / "no-browser"))
+            args = [NODE, str(SCRIPT), "missing-page.html", "--out", str(output)]
+            result = subprocess.run([*args, "--dry-run", "--steps", "click .nav button"],
+                                    cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["groups"][0]["steps"][0]["selector"]["kind"], "css")
+            self.assertFalse(output.exists())
+            errors = []
+            for extra in ([], ["--dry-run"]):
+                result = subprocess.run([*args, *extra, "--steps", "drag .tile 20 nope"],
+                                        cwd=ROOT, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 1)
+                errors.append(result.stderr)
+            self.assertEqual(errors[0], errors[1])
+
+    def test_option_forms_aliases_and_errors(self):
+        parsed = self.dry("--size=desktop,phone,mobile,800x600", "--zoom", "1,2", "--query=a=1&b=2", "--states", "idle,done")
+        self.assertEqual(parsed["sizes"], [{"w": 1440, "h": 900}, {"w": 390, "h": 844}, {"w": 800, "h": 600}])
+        self.assertEqual(parsed["zooms"], [1, 2])
+        self.assertEqual(self.dry("--size", "mobile")["sizes"], [{"w": 390, "h": 844}])
+        self.assertTrue(any("尺寸 已去重" in n for n in parsed["notices"]))
+        self.assertEqual(self.dry()["sizes"], [{"w": 390, "h": 844}])
+        for flag in ("--full", "--mask", "--sheet", "--record", "--motion", "--entry", "--evidence"):
+            with self.subTest(flag=flag):
+                error = self.dry(flag, "extra", ok=False)
+                self.assertIn("page.html 和 extra", error)
+                self.assertIn(flag + " 不带参数", error)
+        for args, expected in [
+            (("--hold1000",), "--hold 1000"), (("--zoon", "2"), "--zoom"),
+            (("--motion", ".respond"), '--motion 不带参数'),
+            (("other.html",), "page.html 和 other.html"),
+            (("--full", "extra"), "page.html 和 extra"),
+            (("--record=true",), "不带参数"), (("--zoom=0",), "--zoom 1,2"),
+            (("--size=0x900",), "--size desktop"), (("--wait=abc",), "--wait 1000"),
+            (("--steps", "clik .open"), "是不是想写 click"),
+            (("--steps", "drag .a 1 nope"), "drag .tiles .paper 240 0"),
+            (("--steps", "wait nope"), "wait 450ms"),
+            (("--steps", "click [aria-label=\"x]"), "没有配对"),
+            (("--steps", "key Invalid+A"), "ControlOrMeta+A"),
+            (("--steps", "same: click .a", "--steps", "same: click .b"), "名字重复"),
+        ]:
+            with self.subTest(args=args):
+                error = self.dry(*args, ok=False)
+                self.assertIn(expected, error)
+                if args == ("--hold1000",):
+                    self.assertEqual(error.count("--hold 1000"), 1)
+                    self.assertNotIn("例如", error)
+
+
 
 class ShootBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if not NODE:
             raise unittest.SkipTest("Node 22+ is not installed")
-        version = subprocess.run([NODE, "--version"], capture_output=True, text=True, timeout=10)
-        if version.returncode or int(version.stdout.strip().lstrip("v").split(".")[0]) < 22:
-            raise unittest.SkipTest("Node 22+ is required")
         cls.browser = find_browser()
         if not cls.browser:
             raise unittest.SkipTest("Chrome, Chromium or Edge is not installed")
@@ -312,12 +438,8 @@ new IntersectionObserver(e=>e.forEach(x=>x.isIntersecting&&x.target.classList.ad
         self.assertIn("首次进入：没有检测到动画", issues)
         self.assertIn("滚动：没有检测到", issues)
 
-    def test_steps_reject_unquoted_selectors_with_spaces(self):
-        output = self.folder / "unquoted"
-        result = subprocess.run([NODE, str(SCRIPT), str(self.page), "--out", str(output), "--steps", "click body #go"],
-                                cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=90)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("加引号", result.stdout + result.stderr)
+    def test_steps_accept_unquoted_selectors_with_spaces(self):
+        self.shoot(self.folder / "unquoted", "--steps", "click body #go")
         self.shoot(self.folder / "quoted", "--steps", 'click "body #go"')
 
     def test_motion_skips_scroll_check_on_single_screen(self):
@@ -346,6 +468,14 @@ h1{margin:40px;height:300px;background:#1e3a8a;animation:rise .3s ease-out both}
         self.shoot(output, "--record", "--entry", "--hold", "300")
         self.assert_artifacts(output, ("motion-start.jpg", "motion-mid.jpg", "motion-end.jpg"))
         self.assertNotEqual((output / "motion-start.jpg").read_bytes(), (output / "motion-end.jpg").read_bytes())
+
+    def test_missing_favicon_is_not_reported_as_a_page_problem(self):
+        self.page.write_text('<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>小样</title></head>'
+                             '<body><h1 style="font-size:32px">没有图标的小样</h1></body></html>', encoding="utf-8")
+        output = self.folder / "no-favicon"
+        self.shoot(output, "--size", "1280x900")
+        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report[0]["issues"], [])
 
     def test_reports_page_problems(self):
         self.page.write_text(self.page.read_text(encoding="utf-8").replace("</body>", '''
@@ -443,6 +573,562 @@ const good = document.querySelector('#good'); good.getContext('webgl2') || good.
         self.shoot(output)
         issues = "\n".join(json.loads((output / "report.json").read_text(encoding="utf-8"))[0]["issues"])
         self.assertIn("WebGL：1 个画布没能创建绘图上下文", issues)
+
+    def run_failure(self, output, *args):
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), "--out", str(output), *args],
+                                cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=110)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        return result
+
+    def test_fill_replaces_and_fires_events_while_type_inserts_at_cursor(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,">
+<input id="insert" value="seed"><input id="replace" value="old value">
+<textarea aria-label="Message box">old text</textarea><input id="empty" value="old value">
+<div id="rich" contenteditable="true">old content</div><button id="verify">Verify</button>
+<script>
+const insert=document.querySelector('#insert'); insert.onfocus=()=>insert.setSelectionRange(2,2);
+const changes={};
+for(const el of document.querySelectorAll('#replace,textarea,#empty,#rich')) {
+  changes[el.id||'textarea']=[];
+  for(const event of ['input','change'])el.addEventListener(event,e=>{
+    if(!e.bubbles)console.error('fill-event-not-bubbling');
+    changes[el.id||'textarea'].push([event,el.isContentEditable?el.textContent:el.value]);
+  });
+}
+document.querySelector('#verify').onclick=()=>{
+  if(insert.value!=='seXed')console.error('type-did-not-insert-at-cursor');
+  for(const [key,value] of Object.entries({replace:'new value',textarea:'new text',empty:'',rich:'new content'})) {
+    const el=key==='textarea'?document.querySelector('textarea'):document.getElementById(key);
+    if((el.isContentEditable?el.textContent:el.value)!==value ||
+       JSON.stringify(changes[key])!==JSON.stringify([['input',value],['change',value]]))console.error('fill-failed-'+key);
+  }
+};</script>''')
+        output = self.folder / 'fill'
+        self.shoot(output, '--size', 'desktop', '--steps', 'type #insert X; fill #replace "new value"; '
+                   'fill [aria-label="Message box"] "new text"; fill #empty ""; '
+                   'fill #rich "new content"; click #verify')
+        self.assertEqual(json.loads((output / 'report.json').read_text())[0]['issues'], [])
+
+    def test_fill_rejects_non_editable_elements_with_context(self):
+        result = self.run_failure(self.folder / 'fill-invalid', '--steps', 'fill #go hello')
+        self.assertIn('第 1 步「fill #go hello」', result.stderr)
+        self.assertIn('fill 需要输入框、文本域或可编辑元素', result.stderr)
+        self.assertIn('例如 fill #message "hello world"', result.stderr)
+
+    def test_click_doubleclick_and_hover_warn_about_blocker_and_still_execute(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+#target,.veil{position:absolute;left:20px;top:20px;width:120px;height:60px}.veil{z-index:2}
+#verify{position:absolute;left:200px;top:20px}</style>
+<button id="target">Target</button><div class="veil">Overlay</div><button id="verify">Verify</button>
+<script>
+let clicks=0,doubles=0,hovers=0,hits=0;
+document.querySelector('.veil').onclick=()=>clicks++;
+document.querySelector('.veil').ondblclick=()=>doubles++;
+document.querySelector('.veil').onmouseenter=()=>hovers++;
+document.querySelector('#target').onclick=()=>hits++;
+document.querySelector('#verify').onclick=()=>{
+if(clicks!==3 || doubles!==1 || hovers!==1 || hits!==0)console.error('blocked-actions-not-executed');
+};</script>''')
+        output = self.folder / 'blocked'
+        result = self.shoot(output, '--steps', 'hover #target; click #target; dblclick #target; click #verify')
+        issues = json.loads((output / 'report.json').read_text())[0]['issues']
+        self.assertEqual(len(issues), 3, issues)
+        for i, action in enumerate(['hover', 'click', 'dblclick'], 1):
+            message = f'第 {i} 步「{action} #target」：中心点被 div.veil 挡住'
+            self.assertIn(message, issues[i - 1])
+            self.assertIn(message, result.stdout)
+            self.assertIn('动作仍照常执行', issues[i - 1])
+        self.assertIn('发现 3 个问题', result.stdout)
+
+    def test_descendant_at_center_is_not_a_blocker_and_mark_does_not_warn(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+#target{width:120px;height:60px}#target span{display:block;width:100%;height:100%}</style>
+<button id="target"><span>Target</span></button><button id="disabled" disabled>Disabled</button>
+<script>let count=0;document.querySelector('#target').onclick=()=>count++;
+document.querySelector('#target').ondblclick=()=>{if(count!==3)console.error('descendant-click-failed')};</script>''')
+        output = self.folder / 'descendant'
+        result = self.shoot(output, '--steps', 'hover #target; click #target; dblclick #target', '--mark', '#disabled')
+        self.assertEqual(json.loads((output / 'report.json').read_text())[0]['issues'], [])
+        self.assertNotIn('提示：第', result.stdout)
+
+    def test_disabled_reasons_are_warnings_and_do_not_stop_actions(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>button{width:100px;height:50px}</style>
+<button id="disabled" disabled>Disabled</button><button id="aria" aria-disabled="true">Aria</button>
+<button id="pointer" style="pointer-events:none">Pointer</button>
+<fieldset disabled><button id="inherited">Inherited</button></fieldset><button id="verify">Verify</button>
+<script>let count=0;document.querySelector('#aria').onclick=()=>count++;
+document.querySelector('#verify').onclick=()=>{if(count!==1)console.error('aria-action-stopped')};</script>''')
+        output = self.folder / 'disabled'
+        result = self.shoot(output, '--size', 'desktop', '--steps', 'hover #disabled; click #aria; '
+                            'dblclick #pointer; click #inherited; click #verify')
+        issues = json.loads((output / 'report.json').read_text())[0]['issues']
+        for step, reason in [('hover #disabled', 'disabled'), ('click #aria', 'aria-disabled="true"'),
+                             ('dblclick #pointer', 'pointer-events: none'), ('click #inherited', 'disabled')]:
+            self.assertTrue(any(f'「{step}」：目标处于禁用状态（{reason}）' in issue for issue in issues), issues)
+            self.assertIn(reason, result.stdout)
+        self.assertFalse(any('控制台错误' in issue for issue in issues), issues)
+        self.assertIn(f'发现 {len(issues)} 个问题', result.stdout)
+
+    def test_action_warnings_are_in_recording_and_motion_reports(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+#target,#overlay{position:absolute;top:20px;left:20px;width:100px;height:50px}#overlay{z-index:2}</style>
+<button id="target" aria-disabled="true">Target</button><div id="overlay">Overlay</div>''')
+        output = self.folder / 'warning-record'
+        result = self.shoot(output, '--motion', '--record', '--steps', 'click #target', '--hold', '0')
+        report = json.loads((output / 'report.json').read_text())
+        self.assertEqual(len(report), 2)
+        self.assertIn('motion', report[0])
+        for entry in report:
+            self.assertTrue(any('中心点被 div#overlay 挡住' in issue for issue in entry['issues']), entry)
+            self.assertTrue(any('aria-disabled="true"' in issue for issue in entry['issues']), entry)
+        self.assertIn('中心点被 div#overlay 挡住', result.stdout)
+        self.assertIn(f"发现 {sum(len(r['issues']) for r in report)} 个问题", result.stdout)
+        # A later failure must not erase warnings already raised by the recording.
+        failed = self.folder / 'warning-before-failure'
+        result = self.run_failure(failed, '--record', '--steps', 'click #target; click .missing', '--hold', '0')
+        entry = json.loads((failed / 'report.json').read_text())[0]
+        self.assertTrue(entry['failed'])
+        self.assertTrue(any('中心点被 div#overlay 挡住' in issue for issue in entry['issues']), entry)
+        self.assertTrue(any('aria-disabled="true"' in issue for issue in entry['issues']), entry)
+        self.assertTrue(any('找不到元素 .missing' in issue for issue in entry['issues']), entry)
+        self.assertIn(f"发现 {len(entry['issues'])} 个问题", result.stdout)
+        self.assertEqual(list(failed.glob('frames*')), [])
+
+    def test_missing_elements_explain_iframe_and_open_shadow_root_scope(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,">
+<iframe srcdoc="<button id='framed'>Framed</button>"></iframe><iframe srcdoc="<p>Another frame</p>"></iframe>
+<div id="host"></div><div id="closed"></div><script>
+const root=document.querySelector('#host').attachShadow({mode:'open'});
+root.innerHTML='<button id="shadowed">Shadowed</button><div id="nested"></div>';
+root.querySelector('#nested').attachShadow({mode:'open'}).innerHTML='<button>Nested</button>';
+document.querySelector('#closed').attachShadow({mode:'closed'}).innerHTML='<button>Closed</button>';
+</script>''')
+        for args in [('--steps', 'click #framed'), ('--steps', 'click text=Shadowed'),
+                     ('--steps', 'fill #shadowed hello'), ('--mark', '#shadowed')]:
+            with self.subTest(args=args):
+                result = self.run_failure(self.folder / 'scope', *args)
+                self.assertIn('找不到元素', result.stderr)
+                self.assertIn('选择器只在主文档里找，页面里有 2 个 iframe、2 个开放的 shadow root', result.stderr)
+        self.page.write_text('<!doctype html><link rel="icon" href="data:,"><body></body>')
+        result = self.run_failure(self.folder / 'no-roots', '--steps', 'click .missing')
+        self.assertNotIn('选择器只在主文档里找', result.stderr)
+
+    def test_missing_element_scope_counts_iframes_and_shadow_roots_independently(self):
+        for markup, expected in [
+            ('<iframe srcdoc="<p>Frame</p>"></iframe>', '1 个 iframe、0 个开放的 shadow root'),
+            ('''<div id="host"></div><script>document.querySelector('#host').attachShadow({mode:'open'}).innerHTML='<p>Shadow</p>';</script>''',
+             '0 个 iframe、1 个开放的 shadow root'),
+        ]:
+            with self.subTest(expected=expected):
+                self.page.write_text('<!doctype html><link rel="icon" href="data:,">' + markup)
+                result = self.run_failure(self.folder / 'root-counts', '--steps', 'click .missing')
+                self.assertIn(expected, result.stderr)
+
+    def test_actions_text_selectors_and_marks(self):
+        self.page.write_text('''<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><style>
+body{margin:0;padding:20px}button{padding:12px}.hidden{display:none}</style>
+<div class="nav"><button aria-label="Send money">More</button><button id="double">Undo</button></div>
+<input aria-label="Message box"><select id="choice"><option value="a">First</option><option value="b">Second item</option></select>
+<div id="status"></div><button class="hidden">More</button><div data-label="a;b">Semicolon</div>
+<script>
+let count=0; document.querySelector('[aria-label]').onclick=()=>count++;
+document.querySelector('#double').ondblclick=()=>count+=10;
+document.querySelector('#double').onmouseenter=()=>document.body.dataset.hover='yes';
+for(const event of ['input','change']) document.querySelector('#choice').addEventListener(event,()=>document.body.dataset[event]='yes');
+setTimeout(()=>{const b=document.createElement('button');b.textContent='Ready';document.body.append(b)},700);
+setInterval(()=>document.querySelector('#status').textContent=JSON.stringify({count,text:document.querySelector('input').value,choice:document.querySelector('select').value,hover:document.body.dataset.hover,input:document.body.dataset.input,change:document.body.dataset.change}),30);
+</script>''', encoding="utf-8")
+        output = self.folder / "actions"
+        result = self.shoot(output, "--steps", 'click text=More; click [aria-label="Send money"]; '
+                            'click "[aria-label=\\"Send money\\"]"; hover button:has-text("Undo"); '
+                            'doubleclick button:has-text(\'Undo\'); fill [aria-label="Message box"] "hello world"; '
+                            'press ControlOrMeta+A; type "body input" "replacement"; select #choice b; '
+                            'select #choice "Second item"; waitfor text=Ready; sleep 0.1s; '
+                            'click [data-label="a;b"]; click :has-text("Semicolon")',
+                            "--mark", '1=text=More; 2=button:has-text("Undo")')
+        self.assert_artifacts(output, ("page.png", "page-marked.png"))
+        # The report includes console output only on errors, so assert browser state through a guard.
+        self.page.write_text(self.page.read_text().replace('setInterval(()=>document', '''setTimeout(()=>{
+if(count!==13 || document.querySelector('input').value!=='replacement' || document.querySelector('select').value!=='b' || document.body.dataset.hover!=='yes' || document.body.dataset.input!=='yes' || document.body.dataset.change!=='yes') console.error('action-guard-failed');
+},2600);setInterval(()=>document'''))
+        self.shoot(self.folder / "guard", "--steps", 'click text=More; click [aria-label="Send money"]; '
+                   'click "[aria-label=\\"Send money\\"]"; hover button:has-text("Undo"); '
+                   'dblclick button:has-text("Undo"); type [aria-label="Message box"] "hello world"; '
+                   'key ControlOrMeta+A; type "body input" replacement; select #choice "Second item"; wait 2000')
+        report = json.loads((self.folder / "guard/report.json").read_text())
+        self.assertEqual(report[0]["issues"], [], result.stdout)
+
+    def test_selector_errors_include_context_and_hints(self):
+        for raw, expected in [
+            ('wait 0; click [id="missing"]', ('第 2 步', 'click [id="missing"]', 'id="go"')),
+            ('click text=切', ('',)),  # containment fallback succeeds, tested separately
+            ('click text=切换不存在', ('可见文字', '切换')),
+            ('click body .missing', ('"body" 匹配 1 个元素',)),
+            ('click button:unknown', ('不是合法的 CSS', 'text="Send money"', 'button:has-text("Undo")')),
+            ('waitfor .missing', ('第 1 步', 'waitfor .missing', '找不到元素')),
+        ]:
+            if expected == ('',):
+                self.shoot(self.folder / "contained", "--steps", raw)
+                continue
+            with self.subTest(raw=raw):
+                result = self.run_failure(self.folder / "missing", "--steps", raw)
+                for text in expected:
+                    self.assertIn(text, result.stderr)
+        self.run_failure(self.folder / "mark-invalid", "--mark", "button:unknown")
+
+    def test_visible_element_does_not_scroll_and_offscreen_does(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+body{margin:0;height:2400px}#top{position:absolute;top:40px}#bottom{position:absolute;top:1800px}</style>
+<button id="top">Top</button><button id="bottom">Bottom</button><script>
+let last=0;topButton=document.querySelector('#top');topButton.onmouseenter=()=>{if(scrollY!==0)console.error('visible-scrolled')};
+topButton.onclick=()=>{if(scrollY!==0)console.error('visible-scrolled')};
+document.querySelector('#bottom').onclick=()=>{if(scrollY===0)console.error('offscreen-not-scrolled')};
+</script>''')
+        self.shoot(self.folder / "scroll", "--size", "desktop", "--steps", "hover #top; click #top; click #bottom")
+        self.assertEqual(json.loads((self.folder / "scroll/report.json").read_text())[0]["issues"], [])
+
+    def test_query_multiple_zooms_and_groups_reset(self):
+        self.page.write_text(self.page.read_text().replace('</body>', '''<script>
+if(new URLSearchParams(location.search).get('a')!=='1' || new URLSearchParams(location.search).get('b')!=='two words')console.error('query-missing');
+document.querySelector('#go').addEventListener('click',()=>{if(document.body.dataset.state!=='b')console.error('group-not-reset')});
+</script></body>'''))
+        output = self.folder / "multiple"
+        self.shoot(output, "--size=desktop", "--zoom=1,2", "--query", "a=1&b=two+words", "--states", "a",
+                   "--steps", "open: click body #go", "--steps", "send: click #go")
+        self.assert_artifacts(output, ("a-open.png", "a-send.png", "a-open-@2x.png", "a-send-@2x.png"))
+        report = json.loads((output / "report.json").read_text())
+        self.assertTrue(all(r["issues"] == [] for r in report))
+        self.assertEqual([r["zoom"] for r in report], [1, 1, 2, 2])
+        aliases = self.folder / "aliases"
+        self.shoot(aliases, "--size", "phone,800x600", "--query", "a=1&b=two+words")
+        self.assert_artifacts(aliases, ("page-390x844.png", "page-800x600.png"))
+
+    def test_named_and_unnamed_record_groups(self):
+        output = self.folder / "record-groups"
+        self.shoot(output, "--record", "--hold=100", "--wait=0", "--steps", "open: click #go", "--steps", "click #go")
+        self.assert_artifacts(output, ("motion-open-start.jpg", "motion-open-mid.jpg", "motion-open-end.jpg", "motion-2-end.jpg"))
+        if shutil.which('ffmpeg'):
+            self.assert_artifacts(output, ("record-open.mp4", "record-2.mp4"))
+        self.assertEqual(len(json.loads((output / "report.json").read_text())), 2)
+
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'ffmpeg is needed for complete evidence')
+    def test_evidence_all_artifacts_and_partial_failure(self):
+        output = self.folder / "evidence"
+        self.shoot(output, "--evidence", "--states=a,b", "--hold=100", "--steps", "toggle: click #go")
+        self.assert_artifacts(output, ("a.png", "b.png", "a-masked.png", "b-masked.png", "sheet.png", "sheet-masked.png",
+                                      "a-@2x.png", "record-entry.mp4", "motion-entry-start.jpg", "motion-entry-mid.jpg", "motion-entry-end.jpg",
+                                      "record-toggle.mp4", "motion-toggle-start.jpg", "motion-toggle-mid.jpg", "motion-toggle-end.jpg"))
+        report = json.loads((output / "report.json").read_text())
+        self.assertTrue(any(r["file"] == "motion-probe-toggle" for r in report))
+        failed = self.folder / "partial"
+        result = self.run_failure(failed, "--evidence", "--hold=100", "--steps", "broken: click .missing", "--steps", "good: click #go")
+        self.assert_artifacts(failed, ("page.png", "page-@2x.png", "record-entry.mp4", "record-good.mp4", "report.json"))
+        report = json.loads((failed / "report.json").read_text())
+        self.assertEqual(sum(r.get("failed", False) for r in report), 2)
+        self.assertIn("失败", result.stdout)
+
+    def test_browser_timeout_retries_once(self):
+        if sys.platform == 'win32':
+            self.skipTest('POSIX launch wrapper')
+        wrapper = self.folder / 'chrome-wrapper'
+        marker = self.folder / 'launch-count'
+        # First launch really times out after 45 seconds; the retry uses the real browser.
+        import shlex
+        wrapper.write_text('#!/bin/sh\nif [ ! -f ' + shlex.quote(str(marker)) + ' ]; then\n'
+                           'touch ' + shlex.quote(str(marker)) + '\nexec sleep 60\nfi\nexec '
+                           + shlex.quote(self.browser) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        env = dict(self.env, CHROME_PATH=str(wrapper))
+        output = self.folder / 'retried'
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output)],
+                                cwd=ROOT, env=env, capture_output=True, text=True, timeout=110)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('45 秒内没有启动', result.stderr)
+        self.assertIn('正在重试一次', result.stderr)
+        self.assertIn('同时开了很多个任务时会变慢', result.stderr)
+        self.assert_artifacts(output, ('page.png', 'report.json'))
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+
+    def test_text_matching_priority_and_combo_modifiers(self):
+        self.page.write_text('''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><style>button{padding:12px}</style>
+<section><span>More</span><button id="clickable">More</button></section>
+<div><button id="deep"><span>Deep</span></button></div><button id="partial">Send money now</button>
+<div hidden><div><button>More</button></div></div><input id="edit"><button id="verify">Verify</button>
+<script>
+const hits=[];for(const id of ['clickable','deep','partial'])document.getElementById(id).onclick=()=>hits.push(id);
+const keys=[];addEventListener('keydown',e=>keys.push([e.key,e.metaKey,e.ctrlKey,e.shiftKey]));
+document.getElementById('verify').onclick=()=>{
+if(hits.join(',')!=='clickable,deep,partial')console.error('text-priority-failed');
+if(!keys.some(k=>k[0]==='A'&&k[1]) || !keys.some(k=>k[0]==='A'&&k[2]) || !keys.some(k=>k[0]==='Tab'&&k[3]))console.error('combo-modifiers-failed');
+};</script>''')
+        output = self.folder / 'priorities'
+        self.shoot(output, '--steps', 'click text=More; click text=Deep; click text="Send money"; '
+                   'click #edit; key Meta+A; key Control+A; key Shift+Tab; click #verify')
+        self.assertEqual(json.loads((output / 'report.json').read_text())[0]['issues'], [])
+
+    def test_mark_and_waitfor_accept_later_visible_css_match(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><button class="target" hidden>Hidden</button>
+<button class="target">Shown</button><div class="delayed" style="opacity:0">Ready</div>
+<script>setTimeout(()=>document.querySelector('.delayed').style.opacity=1,800)</script>''')
+        output = self.folder / 'visible-match'
+        self.shoot(output, '--steps', 'waitfor .target; waitfor .delayed', '--mark', '.target')
+        self.assert_artifacts(output, ('page.png', 'page-marked.png'))
+
+    def test_single_zoom_preserves_sheet_and_record_names(self):
+        output = self.folder / 'zoom-sheet'
+        self.shoot(output, '--zoom', '2', '--states', 'a,b', '--sheet', '--mask')
+        self.assert_artifacts(output, ('a-@2x.png', 'sheet.png', 'sheet-masked.png'))
+        output = self.folder / 'zoom-record'
+        self.shoot(output, '--zoom', '2', '--record', '--steps', 'click #go', '--hold', '100')
+        self.assert_artifacts(output, ('motion-start.jpg', 'motion-mid.jpg', 'motion-end.jpg'))
+        if shutil.which('ffmpeg'):
+            self.assert_artifacts(output, ('record.mp4',))
+
+
+    def test_hidden_matches_report_count_reason_and_visible_example(self):
+        cases = [
+            ('style="display:none"', '', 'display:none'),
+            ('style="visibility:hidden"', '', 'visibility:hidden'),
+            ('style="width:0;height:0;padding:0;border:0"', '', '尺寸为 0'),
+            ('', 'display:none', '被祖先 div#container 隐藏：display:none'),
+            ('', 'visibility:hidden', '被祖先 div#container 隐藏：visibility:hidden'),
+            ('', 'opacity:0', '被祖先 div#container 隐藏：opacity:0'),
+        ]
+        for attrs, parent_style, reason in cases:
+            with self.subTest(reason=reason):
+                self.page.write_text(f'''<!doctype html><link rel="icon" href="data:,">
+<button data-view="activity">Activity</button><div id="container" style="{parent_style}">
+<button data-view="accounts" {attrs}>Accounts</button><button data-view="accounts" {attrs}>Accounts 2</button></div>''')
+                result = self.run_failure(self.folder / 'hidden', '--size', 'desktop', '--steps', 'click [data-view="accounts"]')
+                self.assertIn('匹配到 2 个元素', result.stderr)
+                self.assertIn(reason, result.stderr)
+                self.assertNotIn('找不到元素', result.stderr)
+                self.assertIn('先执行让它出现的那一步', result.stderr)
+                self.assertIn('例如 click [data-view="activity"]', result.stderr)
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><details id="tools">
+<summary>Tools</summary><button data-view="accounts">Accounts</button></details>''')
+        result = self.run_failure(self.folder / 'closed', '--steps', 'click [data-view="accounts"]')
+        self.assertIn('details 未展开', result.stderr)
+        self.assertIn('例如 click #tools > summary', result.stderr)
+        self.shoot(self.folder / 'opened', '--steps', 'click #tools > summary; click [data-view="accounts"]')
+
+    def test_all_actions_choose_first_visible_match(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>button{padding:12px}</style>
+<button class="target" hidden>Hidden</button><button class="target">Visible</button>
+<input class="edit" hidden><input class="edit">
+<select class="choice" hidden><option value="a">A</option><option value="b">B</option></select>
+<select class="choice"><option value="a">A</option><option value="b">B</option></select>
+<button class="double" hidden>Hidden</button><button class="double">Double</button>
+<div class="drag" hidden>Hidden</div><div class="drag" style="width:100px;height:50px">Drag</div>
+<button id="verify">Verify</button><script>
+let clicked=0, hovered=false, doubled=false, dragged=false;
+const target=document.querySelectorAll('.target')[1]; target.onclick=()=>clicked++; target.onmouseenter=()=>hovered=true;
+document.querySelectorAll('.double')[1].ondblclick=()=>doubled=true;
+document.querySelectorAll('.drag')[1].onmousedown=()=>dragged=true;
+document.querySelector('#verify').onclick=()=>{
+if(clicked!==1 || !hovered || !doubled || !dragged || document.querySelectorAll('.edit')[1].value!=='hello' || document.querySelectorAll('.choice')[1].value!=='b')console.error('visible-match-failed');
+};</script>''')
+        output = self.folder / 'visible-actions'
+        self.shoot(output, '--size', 'desktop', '--steps', 'hover .target; click .target; dblclick .double; '
+                   'drag .drag 20 0; type .edit hello; select .choice b; waitfor .target; click #verify')
+        self.assertEqual(json.loads((output / 'report.json').read_text())[0]['issues'], [])
+        # waitfor must continue polling matches that exist but are still hidden.
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><button id="later" hidden>Ready</button>
+<script>setTimeout(()=>document.querySelector('#later').hidden=false,700)</script>''')
+        self.shoot(self.folder / 'later', '--wait', '0', '--steps', 'waitfor #later; click #later')
+
+    def test_selector_examples_and_text_hints_are_relevant(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><p>Alpha unrelated</p><p>Send monez</p>
+<button>Send money now</button><button data-view="accounts" hidden>Hidden</button>
+<button data-view="activity">Activity</button>''')
+        for action in ['click', 'hover', 'dblclick']:
+            result = self.run_failure(self.folder / action, '--steps', action + ' [data-view="missing"]')
+            self.assertIn('例如 ' + action + ' [data-view="activity"]', result.stderr)
+            self.assertLess(result.stderr.index('data-view="activity"'), result.stderr.index('data-view="accounts"'))
+        # A CSS-filtered text search misses; the text hint search covers the visible page.
+        result = self.run_failure(self.folder / 'text-hint', '--steps', 'click a:has-text("Send money")')
+        self.assertIn('例如 click text="Send money now"', result.stderr)
+        self.assertLess(result.stderr.index('可见文字 "Send money now"'), result.stderr.index('可见文字 "Send monez"'))
+        result = self.run_failure(self.folder / 'similar', '--steps', 'click text="Send monet"')
+        self.assertLess(result.stderr.index('可见文字 "Send monez"'), result.stderr.index('可见文字 "Alpha unrelated"'))
+        self.page.write_text('<!doctype html><link rel="icon" href="data:,"><body></body>')
+        result = self.run_failure(self.folder / 'generic', '--steps', 'hover .missing')
+        self.assertIn('例如 hover .open', result.stderr)
+
+    def test_failed_recordings_clean_temporary_frames(self):
+        failed = self.folder / 'failed-record'
+        self.run_failure(failed, '--record', '--steps', 'broken: click .missing', '--hold', '0')
+        self.assertEqual(list(failed.glob('frames*')), [])
+        failed = self.folder / 'failed-evidence'
+        self.run_failure(failed, '--evidence', '--steps', 'broken: click .missing', '--steps', 'good: click #go', '--hold', '100')
+        self.assertEqual(list(failed.glob('frames*')), [])
+        self.assert_artifacts(failed, ('motion-good-end.jpg', 'motion-entry-end.jpg', 'report.json'))
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    def test_cdp_request_times_out_in_current_step(self):
+        import time
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><button id="prepare">Prepare</button><button id="hang">Hang</button>
+<script>document.querySelector('#prepare').onclick=()=>{document.querySelector('#hang').getBoundingClientRect=()=>{while(true){}}};</script>''')
+        output = self.folder / 'cdp-timeout'
+        start = time.monotonic()
+        result = self.run_failure(output, '--size', 'desktop', '--steps', 'click #prepare; click #hang')
+        elapsed = time.monotonic() - start
+        self.assertIn('第 2 步「click #hang」', result.stderr)
+        self.assertIn('CDP Runtime.evaluate 30 秒内没有响应', result.stderr)
+        self.assertGreaterEqual(elapsed, 30)
+        self.assertLess(elapsed, 42)
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+        self.assertTrue(any(r.get('failed') for r in json.loads((output / 'report.json').read_text())))
+
+    def test_browser_disconnect_interrupts_steps_and_cleans_frames(self):
+        if sys.platform == 'win32':
+            self.skipTest('POSIX browser kill wrapper')
+        import http.server
+        import shlex
+        import signal
+        import threading
+        import time
+        pid_file = self.folder / 'chrome.pid'
+        wrapper = self.folder / 'chrome-kill-wrapper'
+        wrapper.write_text('#!/bin/sh\necho $$ > ' + shlex.quote(str(pid_file)) + '\nexec ' + shlex.quote(self.browser) + ' "$@"\n')
+        wrapper.chmod(0o755)
+
+        class KillHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler):
+                handler.send_response(200)
+                handler.end_headers()
+                handler.wfile.write(b'ok')
+                os.kill(int(pid_file.read_text().strip()), signal.SIGKILL)
+
+            def log_message(*args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), KillHandler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.page.write_text(f'''<!doctype html><link rel="icon" href="data:,"><button id="kill">Kill</button>
+<script>document.querySelector('#kill').onclick=()=>setTimeout(()=>fetch('http://127.0.0.1:{server.server_port}/kill'),250);</script>''')
+        output = self.folder / 'disconnect'
+        start = time.monotonic()
+        result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--record', '--hold', '100',
+                                 '--steps', 'disconnect: click #kill; wait 60000'], cwd=ROOT,
+                                env=dict(self.env, CHROME_PATH=str(wrapper)), capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('第 2 步「wait 60000」', result.stderr)
+        self.assertIn('浏览器连接意外断开', result.stderr)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(list(output.glob('frames*')), [])
+        self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+
+    def test_deduplicated_states_sizes_zooms_and_filename_collisions(self):
+        output = self.folder / 'deduplicated'
+        result = self.shoot(output, '--states', 'a,a,b,a', '--size', 'desktop,1440x900,phone,mobile', '--zoom', '1,1.0')
+        report = json.loads((output / 'report.json').read_text())
+        self.assertEqual(len(report), 4)
+        for message in ['状态 已去重', '尺寸 已去重', '倍数 已去重']:
+            self.assertIn(message, result.stdout)
+        output = self.folder / 'group-collision'
+        result = self.shoot(output, '--states', 'a,a-b', '--steps', 'b-c: wait 0', '--steps', 'c: wait 0')
+        report = json.loads((output / 'report.json').read_text())
+        self.assertEqual(len(set(r['file'] for r in report)), 4)
+        self.assert_artifacts(output, ('a-b-c.png', 'a-b-c-2.png'))
+        self.assertIn('文件名冲突，已区分', result.stdout)
+        output = self.folder / 'variant-collision'
+        self.shoot(output, '--states', 'a,a-masked,sheet', '--mask', '--sheet')
+        self.assert_artifacts(output, ('a.png', 'a-masked.png', 'a-masked-2.png', 'a-masked-2-masked.png',
+                                       'sheet.png', 'sheet-masked.png', 'sheet-2.png', 'sheet-2-masked.png'))
+        self.assertEqual(len(list(output.glob('*.png'))), 8)
+
+    def test_screenshots_wait_for_finite_animations_and_transitions(self):
+        self.page.write_text('''<!doctype html><link rel="icon" href="data:,"><style>
+@keyframes enter{from{opacity:0;transform:translateY(40px)}to{opacity:1;transform:none}}
+#box{animation:enter .7s both;transition:margin-left .6s;margin-left:0}
+</style><button id="go">Go</button><div id="box">Ready</div><script>
+document.querySelector('#go').onclick=()=>document.querySelector('#box').style.marginLeft='100px';
+const capture=()=>{
+const s=getComputedStyle(document.querySelector('#box'));
+if(s.opacity!=='1'||parseFloat(s.marginLeft)<99)console.error('captured-during-motion');
+};
+// Screenshot checks read document.images; inspect its computed styles at that moment.
+Object.defineProperty(document,'images',{get(){capture();return []}});
+</script>''')
+        output = self.folder / 'settled'
+        self.shoot(output, '--wait', '0', '--steps', 'click #go')
+        report = json.loads((output / 'report.json').read_text())[0]
+        self.assertEqual(report['issues'], [])
+        self.assertGreater(report['animationWaitMs'], 600)
+        self.assertLessEqual(report['animationWaitMs'], 2000)
+
+    def test_screenshot_animation_wait_is_capped_and_skips_infinite(self):
+        for duration, expected_wait in [('60s', True), ('60s infinite', False)]:
+            with self.subTest(duration=duration):
+                self.page.write_text(f'''<!doctype html><link rel="icon" href="data:,"><style>
+@keyframes slow{{from{{transform:translateX(0)}}to{{transform:translateX(100px)}}}}
+div{{animation:slow {duration}}}</style><div>Ready</div>''')
+                output = self.folder / ('finite-cap' if expected_wait else 'infinite')
+                self.shoot(output, '--wait', '0')
+                waited = json.loads((output / 'report.json').read_text())[0]['animationWaitMs']
+                if expected_wait:
+                    self.assertGreaterEqual(waited, 1950)
+                    self.assertLessEqual(waited, 2000)
+                else:
+                    self.assertEqual(waited, 0)
+        # Recording and motion probing continue to observe the animation from the original timing.
+        output = self.folder / 'record-unsettled'
+        self.shoot(output, '--wait', '0', '--record', '--entry', '--hold', '100')
+        report = json.loads((output / 'report.json').read_text())[0]
+        self.assertNotIn('animationWaitMs', report)
+        self.shoot(self.folder / 'motion-unsettled', '--wait', '0', '--motion')
+        report = json.loads((self.folder / 'motion-unsettled/report.json').read_text())[0]
+        self.assertNotIn('animationWaitMs', report)
+
+
+    def test_disconnect_during_encoding_exits_without_waiting_for_encoder(self):
+        if sys.platform == 'win32':
+            self.skipTest('POSIX browser and encoder wrappers')
+        import shlex
+        import signal
+        import threading
+        import time
+        browser_pid = self.folder / 'browser.pid'
+        wrapper = self.folder / 'chrome-encoder-wrapper'
+        wrapper.write_text('#!/bin/sh\necho $$ > ' + shlex.quote(str(browser_pid)) + '\nexec ' + shlex.quote(self.browser) + ' "$@"\n')
+        wrapper.chmod(0o755)
+        encoder_ready = self.folder / 'encoder-ready'
+        fake_bin = self.folder / 'bin'
+        fake_bin.mkdir()
+        encoder = fake_bin / 'ffmpeg'
+        encoder.write_text('#!/bin/sh\nif [ "$1" = "-version" ]; then exit 0; fi\n'
+                           'touch ' + shlex.quote(str(encoder_ready)) + '\nexec sleep 60\n')
+        encoder.chmod(0o755)
+        stop = threading.Event()
+
+        def disconnect():
+            while not stop.wait(.02):
+                if encoder_ready.exists():
+                    os.kill(int(browser_pid.read_text()), signal.SIGKILL)
+                    return
+
+        thread = threading.Thread(target=disconnect, daemon=True)
+        thread.start()
+        try:
+            output = self.folder / 'encoder-disconnect'
+            start = time.monotonic()
+            result = subprocess.run([NODE, str(SCRIPT), str(self.page), '--out', str(output), '--record', '--hold', '100'],
+                                    cwd=ROOT, env=dict(self.env, CHROME_PATH=str(wrapper), PATH=str(fake_bin) + os.pathsep + os.environ['PATH']),
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertTrue(encoder_ready.exists())
+            self.assertIn('浏览器连接意外断开', result.stderr)
+            self.assertLess(time.monotonic() - start, 10)
+            self.assertEqual(list(output.glob('frames*')), [])
+            self.assertEqual(list(self.profile_root.glob('oil-shoot-*')), [])
+        finally:
+            stop.set()
+            thread.join(1)
+
 
 
 if __name__ == "__main__":

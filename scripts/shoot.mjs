@@ -8,82 +8,241 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-const HELP = `用法：node shoot.mjs <页面地址或文件> [选项]
+const HELP = `常用命令：
+  node scripts/shoot.mjs page.html --size desktop --out shots
+  node scripts/shoot.mjs page.html --size desktop --steps "click .nav button; wait 300" --out shots
+  node scripts/shoot.mjs page.html --size desktop --states idle,done --evidence --steps "send: click text=Send" --out evidence
+
+用法：node shoot.mjs <页面地址或文件> [选项]
 
   --out <目录>          输出目录，默认 ./shots
-  --size <宽x高,...>    视口，默认 390x844；可写多个，例如 390x844,1280x900
+  --size <尺寸,...>     默认 390x844；desktop=1440x900，phone/mobile=390x844，可混用数字尺寸
   --states <a,b,...>    依次用 ?state=<名字> 打开并各截一张
   --param <名字>        状态参数名，默认 state
-  --zoom <倍数>         设备像素比，默认 1；2 即 200% 截图
+  --query <查询参数>    给地址加参数，例如 --query "a=1&b=2"；可和 --states 一起用
+  --zoom <倍数,...>     默认 1；例如 --zoom 1,2，每个倍数各出一套
   --full                截整页，默认只截视口
   --mask                另截一份遮掉全部文字的版本
-  --sheet               把所有状态拼成一张并排图（配合 --mask 再拼一张遮字版）
-  --mark "1=<选择器>;..." 另截一份标注版：给每组元素画框，标上写明的编号；
-                        不写编号时按顺序标 1、2、3。一组选择器匹配到的元素都框上，
-                        编号标在第一个上
-  --steps "<动作>"      截图前先执行的动作，用分号分隔：
-                        click <选择器> | hover <选择器> | drag <选择器> <dx> <dy>
-                        选择器里有空格时加引号：click ".nav .item"
-                        type <选择器> <文字> | key <按键> | scroll <dy> | wait <毫秒>
-  --record              录下 --steps 的执行过程，输出 record.mp4 和开始、中间、结束三帧
-  --entry               配合 --record：先开始录再打开页面，录下首次进入的出场
-  --hold <毫秒>         录屏时动作结束后再录多久，默认 1200
-  --motion              探测动效：首次进入、--steps 动作、首屏滚动、从头滚到底里
-                        有没有动画、幅度多大，没有或太小记为问题；首屏滚动
-                        1.5 屏内几层在变只作报告，供选了首屏景深的页面核对；
-                        页面本身不能滚动时（单屏 App）跳过滚动检查
-  --compare <参考图>    截图还原用：每张截图和参考图（png、jpg、webp）出一张对比图，
-                        参考、当前、叠加、差异热图四格，并按九宫格报告差异像素占比；
-                        参考图按宽度缩放到截图宽度，用 --size 设成参考的逻辑尺寸
-  --wait <毫秒>         页面加载后等多久再截，默认 400
+  --sheet               把状态拼成并排图，配合 --mask 再拼遮字版
+  --mark "1=<选择器>;..." 给匹配的元素画框和编号，另出标注版；不写编号时按顺序编号
+  --steps "<动作>"      可写多次，每组从重新打开的页面开始；可起名："open: click .open"
+  --record              每组录屏并留三帧；单个无名组沿用 record.mp4、motion-start/mid/end.jpg
+  --entry               配合 --record，先开录再打开页面，录首次出场
+  --hold <毫秒>         动作结束后再录多久，默认 1200
+  --motion              探测首次进入、动作反馈、首屏滚动和从头滚到底的动效；单屏跳过滚动
+  --evidence            一次取齐状态截图、并排图和遮字并排图、首状态 2 倍图、动效探测、
+                        首次出场录屏和每组动作录屏；一项失败仍继续其他项
+  --compare <参考图>    截图与 png/jpg/webp 参考图出四格对比和九宫格差异报告
+  --wait <毫秒>         页面加载后等待时间，默认 400；截图另等有限动画，最多 2 秒
+  --dry-run             只检查选项和动作写法，输出解析 JSON，不启动浏览器
 
-每张图都会检查控制台错误、横向溢出和加载失败的图片，结果写进 report.json；
-另外查一组模型默认做法和可读性问题（眉标、彩色单侧边线、卡片套卡片、对比度等），
-写进 report.json 的 lint 字段。`;
+动作写法（用分号分隔；引号、方括号、圆括号里的分号不拆）：
+  click <选择器> | hover <选择器> | dblclick <选择器> | waitfor <选择器>
+  drag <选择器> <dx> <dy>，例如 drag .tiles .paper 240 0
+  type <选择器> <文字>，例如 type [aria-label="Message box"] "hello world"
+  type 在当前光标处插入文字；fill 先清空原内容，再填入文字并触发 input 和 change。
+  fill <选择器> <文字>，例如 fill #message "hello world"
+  type 和 fill 的选择器是第一个词，后代选择器可包引号：fill ".form input" hello
+  select <选择器> <值或可见文字>，例如 select #country "China"
+  key <按键或组合键>，例如 key ControlOrMeta+A；macOS 用 Meta，其他用 Control
+  scroll <dy> | wait <时间>，例如 wait450、wait 450ms、wait 0.5s
+  waitfor 最多等 5 秒，等元素出现并可见。
+  别名：doubleclick=dblclick，press=key，sleep=wait。
 
-const args = process.argv.slice(2);
-if (!args.length || args.includes("--help") || args.includes("-h")) {
-  console.log(HELP);
-  process.exit(args.length ? 0 : 1);
+选择器写法（动作和 --mark 通用）：
+  CSS：click .nav button:nth-child(3)，click [aria-label="Send money"]，无需外层引号
+  文字：click text=More 或 click text="Send money"，先找相等文字，再找包含文字
+  包含文字：click button:has-text("Undo")，单双引号都可；省略 CSS 时查全部元素
+  选择器只在主文档里找，不进入 iframe 或 Shadow DOM；找不到时报告 iframe 和开放 shadow root 数量。
+
+选项都可写成 --名字=值 或 --名字 值；开关不带值。重复状态、尺寸和倍数会去重；文件名冲突会自动加编号。
+元素匹配多个时取第一个可见的；匹配到但隐藏时说明原因，并给可见元素的写法。
+点击、双击和悬停前检查中心点遮挡和禁用状态；提示写进输出和 report.json 的问题汇总，动作照常执行，返回码不变。
+CDP 单个请求超过 30 秒或浏览器意外断开时，报出当前步骤并退出。
+每张图检查控制台错误、横向溢出和加载失败的图片，明细写进 report.json；
+默认做法和可读性提示写进 lint 字段。录屏需要 ffmpeg，没有时只留帧。`;
+
+function fail(message) { console.error(`shoot：${message}`); process.exit(1); }
+function distance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 0; i < a.length; i++) {
+    const next = [i + 1];
+    for (let j = 0; j < b.length; j++) next.push(Math.min(next[j] + 1, row[j + 1] + 1, row[j] + (a[i] !== b[j])));
+    row = next;
+  }
+  return row[b.length];
 }
-if (typeof WebSocket !== "function") fail("需要 Node 22 或更新的版本。");
-
+const closest = (word, choices) => [...choices].sort((a, b) => distance(word, a) - distance(word, b))[0];
+const ACTIONS = ["click", "hover", "dblclick", "drag", "type", "fill", "select", "waitfor", "key", "scroll", "wait"];
+const ALIASES = { doubleclick: "dblclick", press: "key", sleep: "wait" };
+const unquote = (s) => /^(["'])[\s\S]*\1$/.test(s) ? s.slice(1, -1).replace(/\\(["'\\])/g, "$1") : s;
+// Split only outside quoted strings and selector brackets. Preserve the source for diagnostics.
+function splitOutside(text, words = false) {
+  const parts = []; let start = 0, quote = null, outerQuote = null, stack = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") { i++; continue; }
+    // Outer quotes around a selector may contain attribute quotes, even unescaped ones.
+    if (outerQuote) {
+      if (!quote && !stack.length && c === outerQuote) { outerQuote = null; continue; }
+      if (quote) { if (c === quote) quote = null; continue; }
+      if (c === "[" || c === "(") { stack.push(c); continue; }
+      if (c === "]" || c === ")") { stack.pop(); continue; }
+      if (stack.length && (c === '"' || c === "'")) quote = c;
+      continue;
+    }
+    if (quote) { if (c === quote) quote = null; continue; }
+    const quoteStarts = (c === '"' || c === "'") && (i === 0 || /[\s=(]/.test(text[i - 1]));
+    const prefix = text.slice(start, i).trim();
+    const selectorQuote = words ? !parts.length && !prefix :
+      /^(?:click|hover|dblclick|doubleclick|drag|type|fill|select|waitfor)$/.test(prefix) || /^(?:\d+\s*=\s*)?$/.test(prefix);
+    if (quoteStarts) { if (selectorQuote) outerQuote = c; else quote = c; continue; }
+    if (c === "[" || c === "(") stack.push(c);
+    else if (c === "]" || c === ")") {
+      if (stack.pop() !== (c === "]" ? "[" : "(")) throw new Error(`括号没有配对，收到 ${text}；例如 click [aria-label="Send money"]`);
+    } else if (!stack.length && (words ? /\s/.test(c) : c === ";")) {
+      if (text.slice(start, i).trim()) parts.push(text.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  if (quote || outerQuote || stack.length) throw new Error(`引号或括号没有配对，收到 ${text}；例如 click [aria-label="Send money"]`);
+  if (text.slice(start).trim()) parts.push(text.slice(start).trim());
+  return parts;
+}
+function parseSelector(source) {
+  const value = unquote(source.trim());
+  if (!value) throw new Error(`缺少选择器，收到 ${source}；例如 click .open`);
+  if (value.startsWith("text=")) return { kind: "text", value: unquote(value.slice(5).trim()) };
+  const m = value.match(/^(.*):has-text\(\s*(["'])([\s\S]*)\2\s*\)$/);
+  if (m) return { kind: "has-text", css: m[1].trim() || "*", value: unquote(m[2] + m[3] + m[2]) };
+  return { kind: "css", value };
+}
+function parseSteps(text) {
+  let name = null;
+  const named = text.match(/^([A-Za-z0-9_-]+):\s+([\s\S]*)$/);
+  if (named && ![...ACTIONS, ...Object.keys(ALIASES)].includes(named[1])) { name = named[1]; text = named[2]; }
+  const steps = splitOutside(text).map((raw, i) => {
+    const m = raw.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    let action = ALIASES[m[1]] || m[1], tail = m[2] || "";
+    if (/^(wait|sleep)\d/.test(action)) { tail = action.replace(/^(wait|sleep)/, ""); action = "wait"; }
+    const bad = (example) => { throw new Error(`第 ${i + 1} 步动作参数不对，收到 ${raw}；例如 ${example}`); };
+    if (!ACTIONS.includes(action)) throw new Error(`第 ${i + 1} 步不认识的动作，收到 ${raw}；是不是想写 ${closest(action, [...ACTIONS, ...Object.keys(ALIASES)])}？全部动作：${ACTIONS.join("、")}；别名：${Object.keys(ALIASES).join("、")}`);
+    const step = { action, raw, params: {} };
+    if (["click", "hover", "dblclick", "waitfor"].includes(action)) {
+      if (!tail) bad(`${action} .open`);
+      step.selector = parseSelector(tail);
+    } else if (action === "drag") {
+      const match = tail.match(/^([\s\S]+?)\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+))$/);
+      if (!match) bad("drag .tiles .paper 240 0");
+      step.selector = parseSelector(match[1]); step.params = { dx: +match[2], dy: +match[3] };
+    } else if (["type", "fill", "select"].includes(action)) {
+      const tokens = splitOutside(tail, true);
+      if (tokens.length < 2) bad(`${action} #field "hello world"`);
+      step.selector = parseSelector(tokens[0]);
+      step.params = action === "select" ? { value: unquote(tail.slice(tokens[0].length).trim()) } : { text: unquote(tail.slice(tokens[0].length).trim()) };
+    } else if (action === "wait") {
+      const match = tail.match(/^(\d+(?:\.\d+)?)(ms|s)?$/);
+      if (!match) bad("wait 450ms");
+      step.params = { ms: +match[1] * (match[2] === "s" ? 1000 : 1) };
+    } else if (action === "scroll") {
+      if (!tail || !Number.isFinite(Number(tail))) bad("scroll -400");
+      step.params = { dy: +tail };
+    } else {
+      const keys = unquote(tail).split("+");
+      const mods = keys.slice(0, -1);
+      if (!tail || /\s/.test(tail) || mods.some((k) => !["Alt", "Control", "Meta", "Shift", "ControlOrMeta"].includes(k)) || !keys.at(-1)) bad("key ControlOrMeta+A");
+      step.params = { key: keys.at(-1), modifiers: mods };
+    }
+    return step;
+  });
+  return { name, steps };
+}
+const args = process.argv.slice(2);
+if (!args.length || args.includes("--help") || args.includes("-h")) { console.log(HELP); process.exit(args.length ? 0 : 1); }
 const opt = { out: "shots", size: "390x844", param: "state", zoom: "1", hold: "1200", wait: "400" };
 const options = [...HELP.matchAll(/^  (--\S+)/gm)].map((m) => m[1]);
-const flags = new Set();
-let target = null;
+const booleanOptions = new Set(["full", "mask", "sheet", "record", "motion", "entry", "evidence", "dry-run", "force"]);
+const flags = new Set(), stepsInputs = [], positional = [];
+let lastFlag = null;
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
-  if (a === "--force") continue;
-  if (["--full", "--mask", "--sheet", "--record", "--motion", "--entry"].includes(a)) flags.add(a.slice(2));
-  else if (a.startsWith("--")) {
-    if (!options.includes(a)) fail(`不认识的选项 ${a}\n可用选项：${options.join(" ")}`);
-    if (i + 1 >= args.length || args[i + 1].startsWith("--")) fail(`${a} 需要一个值`);
-    opt[a.slice(2)] = args[++i];
-  } else target = a;
+  if (a.startsWith("--")) {
+    const equal = a.indexOf("="), option = equal < 0 ? a : a.slice(0, equal), key = option.slice(2);
+    if (!options.includes(option) && key !== "force") {
+      const glued = options.find((o) => a.startsWith(o) && /^\d/.test(a.slice(o.length)));
+      const suggestion = glued ? `${glued} ${a.slice(glued.length)}` : closest(option, options);
+      const examples = { out: "shots", size: "desktop", states: "idle,done", param: "state", query: '"a=1&b=2"', zoom: "1,2", mark: '"1=.open"', steps: '"click .open"', hold: "1000", compare: "ref.png", wait: "400" };
+      const example = glued ? suggestion : `${suggestion}${examples[suggestion.slice(2)] ? " " + examples[suggestion.slice(2)] : ""}`;
+      fail(`不认识的选项 ${a}；是不是想写 ${example}？\n可用选项：${options.join(" ")}`);
+    }
+    if (booleanOptions.has(key)) {
+      if (equal >= 0) fail(`${option} 不带参数，收到 ${a}；例如 ${option}`);
+      flags.add(key); lastFlag = option;
+    } else {
+      lastFlag = null;
+      if (equal < 0 && (i + 1 >= args.length || args[i + 1].startsWith("--"))) fail(`${option} 需要一个值`);
+      const value = equal < 0 ? args[++i] : a.slice(equal + 1);
+      if (!value) fail(`${option} 需要一个值，收到 ${a}；例如 ${option} 值`);
+      if (key === "steps") stepsInputs.push(value); else opt[key] = value;
+    }
+  } else {
+    if (lastFlag === "--motion" && /^(?:[.#\[]|text=)|:has-text\(/.test(a)) fail(`--motion 不带参数，收到 --motion 和 ${a}；要探测的动作写进 --steps，例如 --motion --steps "click ${a}"`);
+    if (positional.length) fail(`页面地址或多余参数冲突，收到 ${positional[0]} 和 ${a}${lastFlag ? `；${lastFlag} 不带参数` : ""}；例如 page.html --steps "click .open"`);
+    // A flag may precede the one valid target; selector-like extras are never targets.
+    if (lastFlag && /^(?:[.#\[]|text=)/.test(a) && !existsSync(a)) fail(`${lastFlag} 不带参数，收到 ${lastFlag} 和 ${a}；例如 page.html ${lastFlag}`);
+    positional.push(a); lastFlag = null;
+  }
 }
+const target = positional[0];
 if (!target) fail("缺少页面地址或文件。");
-
-const sizes = opt.size.split(",").map((s) => {
-  const m = s.trim().match(/^(\d+)x(\d+)$/);
-  if (!m) fail(`尺寸写成 宽x高，例如 390x844：${s}`);
-  return { w: +m[1], h: +m[2] };
-});
-const states = opt.states ? opt.states.split(",").map((s) => s.trim()).filter(Boolean) : [null];
-const stateIds = states.map((s, i) => !s ? "page" : /^[A-Za-z0-9_-]{1,80}$/.test(s) ? s :
-  `state-${i + 1}-${createHash("sha256").update(s).digest("hex").slice(0, 12)}`);
-const zoom = Number(opt.zoom) || 1;
+const notices = [];
+function deduplicate(values, key, label) {
+  const seen = new Set(), removed = [];
+  const unique = values.filter((value) => {
+    const id = key(value); if (seen.has(id)) { removed.push(id); return false; } seen.add(id); return true;
+  });
+  if (removed.length) notices.push(`${label} 已去重：${[...new Set(removed)].join("、")}`);
+  return unique;
+}
+let groups, sizes, zooms, marks;
+try {
+  groups = stepsInputs.map(parseSteps);
+  const names = groups.map((g, i) => g.name || (groups.length > 1 ? String(i + 1) : ""));
+  if (new Set(names).size !== names.length) throw new Error(`动作组名字重复，收到 ${names.join("、")}；例如 --steps "open: click .open" --steps "send: click .send"`);
+  groups.forEach((g, i) => g.id = names[i]);
+  sizes = opt.size.split(",").map((s) => {
+    const value = ({ desktop: "1440x900", phone: "390x844", mobile: "390x844" })[s.trim()] || s.trim();
+    const m = value.match(/^(\d+)x(\d+)$/);
+    if (!m || +m[1] < 1 || +m[2] < 1) throw new Error(`尺寸不对，收到 ${s}；例如 --size desktop,390x844`);
+    return { w: +m[1], h: +m[2] };
+  });
+  zooms = opt.zoom.split(",").map((s) => {
+    const n = Number(s); if (!Number.isFinite(n) || n <= 0) throw new Error(`倍数不对，收到 ${s}；例如 --zoom 1,2`); return n;
+  });
+  sizes = deduplicate(sizes, (s) => `${s.w}x${s.h}`, "尺寸");
+  zooms = deduplicate(zooms, String, "倍数");
+  for (const key of ["hold", "wait"]) if (!/^\d+(?:\.\d+)?$/.test(opt[key])) throw new Error(`--${key} 需要毫秒数，收到 ${opt[key]}；例如 --${key} 1000`);
+  marks = (opt.mark ? splitOutside(opt.mark) : []).map((s, i) => {
+    const m = s.match(/^(\d+)\s*=\s*(.+)$/);
+    return { label: m ? m[1] : String(i + 1), selector: parseSelector(m ? m[2] : s) };
+  });
+} catch (error) { fail(error.message); }
+const states = deduplicate(opt.states ? opt.states.split(",").map((s) => s.trim()).filter(Boolean) : [null], String, "状态");
+if (!states.length) fail(`--states 没有状态，收到 ${opt.states}；例如 --states idle,done`);
+const stateIds = states.map((s, i) => !s ? "page" : /^[A-Za-z0-9_-]{1,80}$/.test(s) ? s : `state-${i + 1}-${createHash("sha256").update(s).digest("hex").slice(0, 12)}`);
 const refImage = opt.compare ? resolve(opt.compare) : null;
 if (refImage && !existsSync(refImage)) fail(`找不到参考图：${opt.compare}`);
 if (refImage && !/\.(png|jpe?g|webp)$/i.test(refImage)) fail("--compare 只接受 png、jpg 或 webp");
-if (refImage && flags.has("record")) fail("--compare 用在截图上，不和 --record 一起用");
+if (refImage && (flags.has("record") || flags.has("evidence"))) fail("--compare 用在截图上，不和 --record 或 --evidence 一起用；例如 --compare ref.png");
+if (flags.has("dry-run")) {
+  console.log(JSON.stringify({ target, options: opt, flags: [...flags], sizes, zooms, states, groups, marks, notices }, null, 2));
+  process.exit(0);
+}
+if (typeof WebSocket !== "function") fail("需要 Node 22 或更新的版本。");
 const out = resolve(opt.out);
 mkdirSync(out, { recursive: true });
-
-function fail(message) {
-  console.error(`shoot：${message}`);
-  process.exit(1);
-}
+const temporaryFrames = new Set(), encoders = new Set();
+function removeFrames() { for (const dir of temporaryFrames) rmSync(dir, { recursive: true, force: true }); temporaryFrames.clear(); }
 
 // ---------- 本地文件用一个只监听本机的静态服务器打开，模块脚本和 fetch 才能正常工作 ----------
 const MIME = {
@@ -158,69 +317,103 @@ function findChrome() {
 }
 
 const chromePath = findChrome();
-const profile = mkdtempSync(join(tmpdir(), "oil-shoot-"));
-const chrome = spawn(chromePath, [
-  "--headless=new", "--enable-unsafe-swiftshader", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run",
-  "--no-default-browser-check", "--hide-scrollbars", "--mute-audio", "--disable-extensions", "about:blank",
-], { stdio: ["ignore", "ignore", "pipe"] });
-
-let cleaning;
-function cleanup() {
-  return cleaning ||= (async () => {
-    if (chrome.exitCode === null && chrome.signalCode === null) {
-      await new Promise((ok) => {
-        const timer = setTimeout(() => { chrome.kill("SIGKILL"); ok(); }, 3000);
-        chrome.once("close", () => { clearTimeout(timer); ok(); });
-        chrome.kill();
-      });
-    }
-    server?.close();
-    rmSync(profile, { recursive: true, force: true });
-  })();
+let profile, chrome, cleaning;
+async function stopChrome() {
+  if (chrome && chrome.exitCode === null && chrome.signalCode === null) await new Promise((ok) => {
+    const timer = setTimeout(() => { chrome.kill("SIGKILL"); ok(); }, 3000);
+    chrome.once("close", () => { clearTimeout(timer); ok(); }); chrome.kill();
+  });
+  if (profile) rmSync(profile, { recursive: true, force: true });
 }
-// Early startup failures still use process.exit; its handlers must clean up synchronously.
+function cleanup() { return cleaning ||= (async () => { for (const child of encoders) child.kill("SIGKILL"); await stopChrome(); server?.close(); removeFrames(); })(); }
 process.on("exit", () => {
-  try { chrome.kill(); } catch {}
+  try { for (const child of encoders) child.kill("SIGKILL"); removeFrames(); } catch {}
+  try { chrome?.kill(); } catch {}
   try { server?.close(); } catch {}
-  try { rmSync(profile, { recursive: true, force: true }); } catch {}
+  try { if (profile) rmSync(profile, { recursive: true, force: true }); } catch {}
 });
 process.on("SIGINT", async () => { await cleanup(); process.exit(130); });
 process.on("SIGTERM", async () => { await cleanup(); process.exit(143); });
-chrome.on("error", (error) => fail(`浏览器启动失败：${error.message}`));
-
-const wsUrl = await new Promise((ok) => {
-  let buf = "";
-  const timer = setTimeout(() => fail("浏览器 15 秒内没有启动。"), 15000);
-  chrome.stderr.on("data", (d) => {
-    buf += d;
-    const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
-    if (m) { clearTimeout(timer); ok(m[1]); }
+async function launchChrome() {
+  profile = mkdtempSync(join(tmpdir(), "oil-shoot-"));
+  chrome = spawn(chromePath, ["--headless=new", "--enable-unsafe-swiftshader", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "--no-first-run",
+    "--no-default-browser-check", "--hide-scrollbars", "--mute-audio", "--disable-extensions", "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+  return new Promise((ok, no) => {
+    let buf = "";
+    const timer = setTimeout(() => finish(new Error("timeout")), 45000);
+    const onData = (d) => { buf += d; const m = buf.match(/DevTools listening on (ws:\/\/\S+)/); if (m) finish(null, m[1]); };
+    const onError = (e) => finish(e);
+    const onExit = () => finish(new Error("浏览器提前退出"));
+    function finish(error, url) {
+      clearTimeout(timer); chrome.stderr.off("data", onData); chrome.off("error", onError); chrome.off("exit", onExit);
+      error ? no(error) : ok(url);
+    }
+    chrome.stderr.on("data", onData); chrome.once("error", onError); chrome.once("exit", onExit);
   });
-});
+}
+let wsUrl;
+for (let attempt = 0; attempt < 2; attempt++) {
+  try { wsUrl = await launchChrome(); break; }
+  catch (error) {
+    await stopChrome();
+    if (attempt || error.message !== "timeout") fail(`浏览器启动失败：${error.message === "timeout" ? "45 秒内没有启动，重试一次仍失败" : error.message}；同时开了很多个任务时会变慢。`);
+    console.error("shoot：浏览器 45 秒内没有启动，正在重试一次；同时开了很多个任务时会变慢。");
+  }
+}
 
 // ---------- Chrome DevTools 协议 ----------
+let currentContext = "连接浏览器", transportFailure = null, finishing = false;
+async function during(context, work) {
+  const previous = currentContext; currentContext = context;
+  try { return await work(); } finally { currentContext = previous; }
+}
 const ws = new WebSocket(wsUrl);
-await new Promise((ok, no) => { ws.onopen = ok; ws.onerror = () => no(new Error("连接浏览器失败")); });
 let seq = 0;
-const pending = new Map();
-const listeners = [];
+const pending = new Map(), listeners = [];
+let saveFatalReport = () => {};
+function abortTransport(error) {
+  if (transportFailure || finishing) return;
+  transportFailure = error; process.exitCode = 1;
+  for (const request of pending.values()) { clearTimeout(request.timer); request.no(error); }
+  pending.clear();
+  console.error(`shoot：${error.message}`);
+  try { saveFatalReport(error); } catch {}
+  void cleanup().finally(() => process.exit(1));
+}
+ws.onclose = () => abortTransport(new Error(`${currentContext}：浏览器连接意外断开，已停止执行。`));
+ws.onerror = () => abortTransport(new Error(`${currentContext}：浏览器连接出错，已停止执行。`));
+try {
+  await new Promise((ok, no) => {
+    const timer = setTimeout(() => { const error = new Error("连接浏览器：30 秒内没有响应，已停止执行。"); no(error); abortTransport(error); }, 30000);
+    ws.onopen = () => { clearTimeout(timer); ok(); };
+    const failed = () => { clearTimeout(timer); no(transportFailure || new Error("连接浏览器失败")); };
+    ws.addEventListener("close", failed, { once: true }); ws.addEventListener("error", failed, { once: true });
+  });
+} catch { await cleanup(); process.exit(1); }
 ws.onmessage = (event) => {
   const msg = JSON.parse(event.data);
   if (msg.id && pending.has(msg.id)) {
-    const { ok, no } = pending.get(msg.id);
-    pending.delete(msg.id);
-    msg.error ? no(new Error(msg.error.message)) : ok(msg.result);
+    const { ok, no, timer, context } = pending.get(msg.id);
+    pending.delete(msg.id); clearTimeout(timer);
+    msg.error ? no(new Error(`${context}：${msg.error.message}`)) : ok(msg.result);
   } else if (msg.method) listeners.forEach((fn) => fn(msg));
 };
 const send = (method, params = {}, sessionId) => new Promise((ok, no) => {
-  const id = ++seq;
-  pending.set(id, { ok, no });
-  ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+  if (transportFailure || ws.readyState !== WebSocket.OPEN) { no(transportFailure || new Error(`${currentContext}：浏览器连接已经断开。`)); return; }
+  const id = ++seq, context = currentContext;
+  const timer = setTimeout(() => abortTransport(new Error(`${context}：CDP ${method} 30 秒内没有响应，已停止执行。`)), 30000);
+  pending.set(id, { ok, no, timer, context });
+  try { ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
+  catch { abortTransport(new Error(`${context}：发送 CDP ${method} 时浏览器连接断开，已停止执行。`)); }
 });
 
-const { targetId } = await send("Target.createTarget", { url: "about:blank" });
-const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
-const cdp = (method, params) => send(method, params, sessionId);
+async function setupSend(...args) {
+  try { return await send(...args); }
+  catch (error) { if (transportFailure) { await cleanup(); process.exit(1); } throw error; }
+}
+const { targetId } = await setupSend("Target.createTarget", { url: "about:blank" });
+const { sessionId } = await setupSend("Target.attachToTarget", { targetId, flatten: true });
+const cdp = (method, params) => setupSend(method, params, sessionId);
 await cdp("Page.enable");
 await cdp("Runtime.enable");
 await cdp("Log.enable");
@@ -240,11 +433,15 @@ await cdp("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
 })()` });
 
 let problems = [];
+function isAutoFavicon(url) {
+  try { return new URL(url || "").pathname === "/favicon.ico"; } catch { return false; }
+}
 listeners.push((m) => {
   if (m.sessionId !== sessionId) return;
   if (m.method === "Runtime.exceptionThrown") problems.push(`脚本错误：${m.params.exceptionDetails?.exception?.description?.split("\n")[0] || m.params.exceptionDetails?.text}`);
   if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") problems.push(`控制台错误：${m.params.args.map((a) => a.value ?? a.description ?? "").join(" ").slice(0, 200)}`);
-  if (m.method === "Log.entryAdded" && m.params.entry.level === "error") problems.push(`加载错误：${m.params.entry.text.slice(0, 200)} ${m.params.entry.url || ""}`.trim());
+  // Browsers ask for /favicon.ico on their own; a mockup without one has no page problem.
+  if (m.method === "Log.entryAdded" && m.params.entry.level === "error" && !isAutoFavicon(m.params.entry.url)) problems.push(`加载错误：${m.params.entry.text.slice(0, 200)} ${m.params.entry.url || ""}`.trim());
 });
 
 const evaluate = async (expression) => {
@@ -260,15 +457,23 @@ async function setViewport(w, h, scale) {
 }
 
 async function open(url) {
-  const loaded = new Promise((ok) => {
-    const fn = (m) => { if (m.sessionId === sessionId && m.method === "Page.loadEventFired") { listeners.splice(listeners.indexOf(fn), 1); ok(); } };
-    listeners.push(fn);
+  return during(`${currentContext} / 打开页面 ${url}`, async () => {
+    let loadedListener, timer;
+    const loaded = new Promise((ok) => {
+      loadedListener = (m) => { if (m.sessionId === sessionId && m.method === "Page.loadEventFired") ok(); };
+      listeners.push(loadedListener);
+      timer = setTimeout(ok, 15000);
+    });
+    try {
+      const nav = await cdp("Page.navigate", { url });
+      if (nav.errorText) throw new Error(`打不开 ${url}：${nav.errorText}`);
+      await loaded;
+      await evaluate(`document.fonts ? document.fonts.ready.then(() => true) : true`);
+      await sleep(Number(opt.wait));
+    } finally {
+      clearTimeout(timer); const index = listeners.indexOf(loadedListener); if (index >= 0) listeners.splice(index, 1);
+    }
   });
-  const nav = await cdp("Page.navigate", { url });
-  if (nav.errorText) throw new Error(`打不开 ${url}：${nav.errorText}`);
-  await Promise.race([loaded, sleep(15000)]);
-  await evaluate(`document.fonts ? document.fonts.ready.then(() => true) : true`);
-  await sleep(Number(opt.wait));
 }
 
 async function check() {
@@ -518,12 +723,6 @@ function lintPage() {
 }
 
 async function lint() {
-  // 等一次性的动画播完，免得把正在淡入的内容当成停住了
-  await evaluate(`(() => {
-    const running = document.getAnimations ? document.getAnimations().filter((a) => a.playState === "running" && a.timeline === document.timeline
-      && a.effect && a.effect.getTiming && a.effect.getTiming().iterations !== Infinity) : [];
-    return Promise.race([Promise.all(running.map((a) => a.finished.catch(() => {}))), new Promise((ok) => setTimeout(ok, 2500))]).then(() => true);
-  })()`);
   try {
     return await evaluate(`(${lintPage.toString()})()`);
   } catch (error) {
@@ -531,6 +730,23 @@ async function lint() {
   }
 }
 const lintLine = (items) => items.map((i) => `${i.label} ${i.count} 处（${i.examples.join("，")}）`).join("；");
+
+async function settleAnimations(limit) {
+  if (limit <= 0) return 0;
+  return during(`${currentContext} / 等待有限动画结束`, () => evaluate(`(async () => {
+    const start = performance.now(), limit = ${limit};
+    let waited = false;
+    while (true) {
+      const animations = document.getAnimations().filter((a) => (a.playState === "running" || a.pending) && a.effect
+        && Number.isFinite(a.effect.getComputedTiming().endTime));
+      if (!animations.length || performance.now() - start >= limit) break;
+      waited = true;
+      await Promise.race([Promise.all(animations.map((a) => a.finished.catch(() => {}))),
+        new Promise((ok) => setTimeout(ok, Math.min(50, Math.max(0, limit - (performance.now() - start))))) ]);
+    }
+    return waited ? Math.min(limit, Math.round(performance.now() - start)) : 0;
+  })()`));
+}
 
 async function screenshot(file, full) {
   let clip;
@@ -549,12 +765,10 @@ const MASK_CSS = `*,*::before,*::after{text-shadow:none!important;-webkit-text-f
 const mask = () => evaluate(`(() => { const s = document.createElement("style"); s.id = "oil-mask"; s.textContent = ${JSON.stringify(MASK_CSS)}; document.head.append(s); return true; })()`);
 
 // 标注版：框和编号画在页面最上层，按文档坐标定位，整页截图时也对得上。
-const marks = (opt.mark ? opt.mark.split(";").map((s) => s.trim()).filter(Boolean) : []).map((s, i) => {
-  const m = s.match(/^(\d+)\s*=\s*(.+)$/);
-  return m ? { label: m[1], selector: m[2].trim() } : { label: String(i + 1), selector: s };
-});
 async function mark() {
+  for (const { selector } of marks) await locate(selector, "--mark", false);
   const result = await evaluate(`((selectors) => {
+    const find = ${findSource};
     const layer = document.createElement("div");
     layer.id = "oil-mark";
     layer.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none";
@@ -562,7 +776,7 @@ async function mark() {
     const missing = [];
     selectors.forEach(({ label, selector }) => {
       let found;
-      try { found = [...document.querySelectorAll(selector)]; } catch { missing.push(selector + "（选择器写错了）"); return; }
+      try { found = find(selector); } catch { missing.push(selector + "（选择器写错了）"); return; }
       const boxes = found.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0);
       if (!boxes.length) { missing.push(selector + (found.length ? "（元素不可见）" : "")); return; }
       boxes.forEach((r, j) => {
@@ -590,38 +804,207 @@ async function mark() {
 const unmark = () => evaluate(`(document.getElementById("oil-mark")?.remove(), true)`);
 
 // ---------- 动作 ----------
-function tokenize(text) {
-  return [...text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3]);
+// Serialized into the page; each helper includes its own dependencies.
+function hiddenReason(el) {
+  const describe = (e) => e.tagName.toLowerCase() + (e.id ? "#" + e.id : "");
+  for (let e = el; e; e = e.parentElement) {
+    const style = getComputedStyle(e);
+    const owner = e === el ? "" : "被祖先 " + describe(e) + " 隐藏：";
+    if (style.display === "none") return owner + "display:none";
+    // An ancestor's hidden visibility can be overridden by the child.
+    if (e === el && (style.visibility === "hidden" || style.visibility === "collapse")) {
+      let owner = e;
+      while (owner.parentElement && getComputedStyle(owner.parentElement).visibility === style.visibility) owner = owner.parentElement;
+      return (owner === el ? "" : "被祖先 " + describe(owner) + " 隐藏：") + "visibility:" + style.visibility;
+    }
+    if (Number(style.opacity) === 0) return owner + "opacity:0";
+    if (style.contentVisibility === "hidden") return owner + "content-visibility:hidden";
+    if (e !== el && e.tagName === "DETAILS" && !e.open && !e.querySelector(":scope > summary")?.contains(el)) return "被祖先 " + describe(e) + " 隐藏：details 未展开";
+  }
+  const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return "尺寸为 0（宽 " + r.width + "px，高 " + r.height + "px）";
+  if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return "被祖先或浏览器布局隐藏";
+  return null;
 }
-const KEYS = { ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Enter: 13, Escape: 27, Tab: 9, " ": 32, Space: 32, Home: 36, End: 35, PageUp: 33, PageDown: 34, Backspace: 8 };
-async function center(selector) {
-  const box = await evaluate(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; el.scrollIntoView({ block: "center", inline: "center" }); const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
-  if (!box) throw new Error(`找不到元素：${selector}`);
-  return box;
+function findElements(selector, includeHidden = false) {
+  const reason = hiddenReason;
+  const text = (el) => (includeHidden && reason(el) ? el.textContent : typeof el.innerText === "string" ? el.innerText : el.textContent || "").trim().replace(/\s+/g, " ");
+  const all = [...document.querySelectorAll(selector.kind === "css" ? selector.value : selector.kind === "has-text" ? selector.css : "*")];
+  const visible = all.filter((el) => !reason(el));
+  if (selector.kind === "css") return includeHidden ? all : visible;
+  const wanted = selector.value.trim().replace(/\s+/g, " ");
+  const match = (pool) => {
+    // Script literals and metadata are not page text, including in hidden-match diagnostics.
+    pool = pool.filter((el) => !el.closest("script,style,template,noscript,head"));
+    if (selector.kind === "has-text") return pool.filter((el) => text(el).includes(wanted));
+    let found = pool.filter((el) => text(el) === wanted);
+    if (!found.length) found = pool.filter((el) => text(el).includes(wanted));
+    const depth = (el) => { let n = 0; for (; el; el = el.parentElement) n++; return n; };
+    found.sort((a, b) => depth(b) - depth(a) || Number(b.matches("button,a,[role=button],input,label,summary,[tabindex]")) - Number(a.matches("button,a,[role=button],input,label,summary,[tabindex]")));
+    return found;
+  };
+  return includeHidden ? match(all) : match(visible).slice(0, 1);
 }
+const findSource = findElements.toString().replace("const reason = hiddenReason;", "const reason = " + hiddenReason.toString() + ";");
+async function locate(selector, context, scroll = true, action = "click", params = {}) {
+  const result = await evaluate(String.raw`((selector) => {
+    const find = ${findSource}, reason = ${hiddenReason.toString()};
+    let found, usable;
+    try { found = find(selector, true); usable = find(selector); } catch { return { invalid: true }; }
+    const el = usable[0];
+    if (el) {
+      let r = el.getBoundingClientRect();
+      if (${scroll} && (r.bottom <= 0 || r.right <= 0 || r.top >= innerHeight || r.left >= innerWidth)) {
+        el.scrollIntoView({ block: "center", inline: "center" }); r = el.getBoundingClientRect();
+      }
+      const x = Math.max(1, Math.min(innerWidth - 1, r.left + r.width / 2)), y = Math.max(1, Math.min(innerHeight - 1, r.top + r.height / 2));
+      const warnings = [];
+      if (${scroll && ["click", "dblclick", "hover"].includes(action)}) {
+        const identify = (element) => {
+          const parts = [];
+          for (let e = element; e; e = e.parentElement) {
+            let part = e.localName;
+            if (e.id) part += "#" + CSS.escape(e.id);
+            else {
+              part += [...e.classList].slice(0, 3).map((c) => "." + CSS.escape(c)).join("");
+              const siblings = e.parentElement ? [...e.parentElement.children].filter((s) => s.localName === e.localName) : [e];
+              if (siblings.length > 1) part += ":nth-of-type(" + (siblings.indexOf(e) + 1) + ")";
+            }
+            parts.unshift(part);
+            if (document.querySelectorAll(parts.join(" > ")).length === 1) break;
+          }
+          return parts.join(" > ");
+        };
+        const top = document.elementFromPoint(x, y);
+        if (top && top !== el && !el.contains(top)) warnings.push("中心点被 " + identify(top) + " 挡住，动作仍照常执行");
+        const disabled = [];
+        if (el.hasAttribute("disabled") || el.matches(":disabled")) disabled.push("disabled");
+        if (el.getAttribute("aria-disabled")?.toLowerCase() === "true") disabled.push('aria-disabled="true"');
+        if (getComputedStyle(el).pointerEvents === "none") disabled.push("pointer-events: none");
+        if (disabled.length) warnings.push("目标处于禁用状态（" + disabled.join("、") + "），动作仍照常执行");
+      }
+      return { x, y, warnings };
+    }
+    const hints = [], suggestions = [];
+    const css = selector.kind === "css" ? selector.value : selector.css || "";
+    const attrs = [...css.matchAll(/\[([^\s~|^$*!=\]]+)(?:[^\]]*)\]/g)].map((m) => m[1]);
+    for (const attr of selector.kind === "css" ? [...new Set(attrs)] : []) {
+      const candidates = [...document.querySelectorAll("*")].filter((e) => e.hasAttribute(attr));
+      candidates.sort((a, b) => Number(!!reason(a)) - Number(!!reason(b)));
+      const seen = new Set();
+      for (const e of candidates) {
+        const value = e.getAttribute(attr); if (seen.has(value)) continue; seen.add(value);
+        const query = "[" + CSS.escape(attr) + "=" + JSON.stringify(value) + "]";
+        if (hints.length < 5) hints.push(attr + "=" + JSON.stringify(value) + (reason(e) ? "（不可见）" : ""));
+        if (!reason(e)) suggestions.push(query);
+      }
+      if (!candidates.length && hints.length < 5) hints.push("页面没有属性 " + attr);
+    }
+    if (selector.kind !== "css") {
+      const distance = ${distance.toString()};
+      const texts = [...new Set([...document.querySelectorAll("body *")].filter((e) => !reason(e))
+        .map((e) => (typeof e.innerText === "string" ? e.innerText : e.textContent || "").trim().replace(/\s+/g, " ")).filter((t) => t && t.length < 160))];
+      const wanted = selector.value.trim().replace(/\s+/g, " ");
+      const contains = (t) => t.includes(wanted) || wanted.includes(t);
+      texts.sort((a, b) => Number(contains(b)) - Number(contains(a)) || distance(a, wanted) - distance(b, wanted));
+      hints.push(...texts.slice(0, 5).map((t) => "可见文字 " + JSON.stringify(t)));
+      suggestions.push(...texts.slice(0, 5).map((t) => "text=" + JSON.stringify(t)));
+    }
+    if (!hints.length) {
+      const prefix = css.replace(/\s*[^\s]+$/, "").replace(/[>+~]\s*$/, "").trim();
+      let matches = []; try { if (prefix) matches = [...document.querySelectorAll(prefix)]; } catch {}
+      hints.push("去掉最后一段后 " + JSON.stringify(prefix || "（空）") + " 匹配 " + matches.length + " 个元素");
+      if (matches.some((e) => !reason(e))) suggestions.push(prefix);
+    }
+    const closed = found[0]?.closest("details:not([open])"), summary = closed?.querySelector(":scope > summary");
+    const opener = summary && !reason(summary) ? (closed.id ? "#" + CSS.escape(closed.id) + " > summary" : "details:not([open]) > summary") : null;
+    let iframes = 0, shadowRoots = 0;
+    if (!found.length) {
+      const roots = [document];
+      for (let i = 0; i < roots.length; i++) for (const e of roots[i].querySelectorAll("*")) {
+        if (e.localName === "iframe") iframes++;
+        if (e.shadowRoot) { shadowRoots++; roots.push(e.shadowRoot); }
+      }
+    }
+    return { opener, missing: !found.length, count: found.length, reasons: [...new Set(found.map(reason))].slice(0, 5), hints: hints.slice(0, 5), suggestion: suggestions[0], iframes, shadowRoots };
+  })(${JSON.stringify(selector)})`);
+  const source = selector.kind === "css" ? selector.value : selector.kind === "text" ? `text=${selector.value}` : `${selector.css}:has-text(${JSON.stringify(selector.value)})`;
+  const suffix = action === "drag" ? ` ${params.dx ?? 0} ${params.dy ?? 0}` : ["type", "fill"].includes(action) ? ` ${JSON.stringify(params.text ?? "文字")}` : action === "select" ? ` ${JSON.stringify(params.value ?? "选项")}` : "";
+  const example = result.opener && !result.suggestion ? `click ${result.opener}` : `${action} ${result.suggestion || (selector.kind === "css" ? ".open" : 'text="Send money"')}${suffix}`;
+  if (result.invalid) throw new Error(`${context}：${source} 不是合法的 CSS；支持文字写法 text="Send money" 和 button:has-text("Undo")，例如 ${action} text="Send money"${suffix}`);
+  const scope = result.iframes || result.shadowRoots ? `；选择器只在主文档里找，页面里有 ${result.iframes} 个 iframe、${result.shadowRoots} 个开放的 shadow root` : "";
+  if (result.missing) throw new Error(`${context}：找不到元素 ${source}；线索：${result.hints.join("；")}；例如 ${example}${scope}`);
+  if (result.count) throw new Error(`${context}：匹配到 ${result.count} 个元素 ${source}，但都不可见，不能操作（${result.reasons.join("；")}）；先执行让它出现的那一步，或换成当前可见的元素；线索：${result.hints.join("；")}；例如 ${example}`);
+  for (const warning of result.warnings || []) {
+    const message = `${context}：${warning}`;
+    problems.push(message); console.log(`提示：${message}`);
+  }
+  return result;
+}
+const KEYS = { ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Enter: 13, Escape: 27, Tab: 9, " ": 32, Space: 32, Home: 36, End: 35, PageUp: 33, PageDown: 34, Backspace: 8, Delete: 46 };
 const mouse = (type, x, y, extra = {}) => cdp("Input.dispatchMouseEvent", { type, x, y, button: "left", pointerType: "mouse", ...extra });
-async function runSteps(text) {
-  for (const raw of (text || "").split(";").map((s) => s.trim()).filter(Boolean)) {
-    const [verb, ...rest] = tokenize(raw);
-    const arity = { click: 1, hover: 1, drag: 3 }[verb];
-    if (arity && rest.length !== arity) throw new Error(`动作参数不对：${raw}。选择器里有空格时要加引号，例如 ${verb} ".nav .item"${verb === "drag" ? " 0 -80" : ""}`);
-    if (verb === "wait") await sleep(Number(rest[0]) || 0);
-    else if (verb === "click") { const p = await center(rest[0]); await mouse("mouseMoved", p.x, p.y); await mouse("mousePressed", p.x, p.y, { clickCount: 1 }); await mouse("mouseReleased", p.x, p.y, { clickCount: 1 }); await sleep(120); }
-    else if (verb === "hover") { const p = await center(rest[0]); await mouse("mouseMoved", p.x, p.y); await sleep(200); }
-    else if (verb === "drag") {
-      const p = await center(rest[0]); const dx = Number(rest[1]) || 0; const dy = Number(rest[2]) || 0;
-      await mouse("mouseMoved", p.x, p.y); await mouse("mousePressed", p.x, p.y, { clickCount: 1, buttons: 1 });
-      for (let i = 1; i <= 24; i++) { await mouse("mouseMoved", p.x + (dx * i) / 24, p.y + (dy * i) / 24, { buttons: 1 }); await sleep(16); }
-      await mouse("mouseReleased", p.x + dx, p.y + dy, { clickCount: 1 }); await sleep(150);
-    } else if (verb === "type") {
-      await evaluate(`(() => { const el = document.querySelector(${JSON.stringify(rest[0])}); if (!el) throw new Error(${JSON.stringify("找不到元素：" + rest[0])}); el.focus(); return true; })()`);
-      await cdp("Input.insertText", { text: rest.slice(1).join(" ") }); await sleep(120);
-    } else if (verb === "key") {
-      const key = rest[0] === "Space" ? " " : rest[0]; const code = KEYS[rest[0]] ?? key.toUpperCase().charCodeAt(0);
-      await cdp("Input.dispatchKeyEvent", { type: "keyDown", key, code: rest[0], windowsVirtualKeyCode: code });
-      await cdp("Input.dispatchKeyEvent", { type: "keyUp", key, code: rest[0], windowsVirtualKeyCode: code }); await sleep(80);
-    } else if (verb === "scroll") { await evaluate(`scrollBy(0, ${Number(rest[0]) || 0}), true`); await sleep(200); }
-    else throw new Error(`不认识的动作：${raw}`);
+async function runSteps(steps = []) {
+  for (const [i, step] of steps.entries()) {
+    const { action, selector, params } = step;
+    const context = `第 ${i + 1} 步「${step.raw}」`;
+    await during(`${currentContext} / ${context}`, async () => {
+      if (action === "wait") { await sleep(params.ms); return; }
+      if (action === "waitfor") {
+        const end = Date.now() + 5000;
+        while (true) {
+          try { await locate(selector, context, false, action, params); break; }
+          catch (error) { if ((!error.message.includes("找不到元素") && !error.message.includes("都不可见")) || Date.now() >= end) throw error; await sleep(100); }
+        }
+        return;
+      }
+      if (["click", "hover", "dblclick", "drag"].includes(action)) {
+        const p = await locate(selector, context, true, action, params);
+        await mouse("mouseMoved", p.x, p.y);
+        if (action === "hover") { await sleep(200); return; }
+        await mouse("mousePressed", p.x, p.y, { clickCount: 1, buttons: 1 });
+        if (action === "drag") {
+          for (let n = 1; n <= 24; n++) { await mouse("mouseMoved", p.x + params.dx * n / 24, p.y + params.dy * n / 24, { buttons: 1 }); await sleep(16); }
+          await mouse("mouseReleased", p.x + params.dx, p.y + params.dy, { clickCount: 1 });
+        } else {
+          await mouse("mouseReleased", p.x, p.y, { clickCount: 1 });
+          if (action === "dblclick") {
+            await mouse("mousePressed", p.x, p.y, { clickCount: 2 }); await mouse("mouseReleased", p.x, p.y, { clickCount: 2 });
+          }
+        }
+        await sleep(120);
+      } else if (["type", "fill", "select"].includes(action)) {
+        await locate(selector, context, false, action, params);
+        await evaluate(`(() => {
+          const el = (${findSource})(${JSON.stringify(selector)})[0];
+          el.focus();
+          ${action === "select" ? `if (!(el instanceof HTMLSelectElement)) throw new Error(${JSON.stringify(`${context}：select 需要原生下拉框；例如 select #country China`)});
+          const option = [...el.options].find((o) => o.value === ${JSON.stringify(params.value)}) || [...el.options].find((o) => o.textContent.trim() === ${JSON.stringify(params.value)});
+          if (!option) throw new Error(${JSON.stringify(`${context}：找不到下拉选项 ${params.value}；例如 select #country China`)});
+          el.value = option.value; el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));` : action === "fill" ? `
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+            const prototype = el instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+            const set = Object.getOwnPropertyDescriptor(prototype, "value").set;
+            set.call(el, ""); set.call(el, ${JSON.stringify(params.text)});
+          } else if (el.isContentEditable) {
+            el.replaceChildren(); el.textContent = ${JSON.stringify(params.text)};
+            const range = document.createRange(); range.selectNodeContents(el); range.collapse(false);
+            const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+          } else throw new Error(${JSON.stringify(`${context}：fill 需要输入框、文本域或可编辑元素；例如 fill #message "hello world"`)});
+          el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));` : ""}
+          return true;
+        })()`);
+        if (action === "type") await cdp("Input.insertText", { text: params.text });
+        await sleep(120);
+      } else if (action === "key") {
+        const modifiers = params.modifiers.reduce((n, k) => n | ({ Alt: 1, Control: 2, Meta: 4, Shift: 8, ControlOrMeta: process.platform === "darwin" ? 4 : 2 })[k], 0);
+        const key = params.key === "Space" ? " " : params.key;
+        const code = KEYS[params.key] ?? key.toUpperCase().charCodeAt(0);
+        const event = { key, code: /^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` : /^\d$/.test(key) ? `Digit${key}` : params.key, windowsVirtualKeyCode: code, modifiers };
+        await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...event, ...(modifiers & 4 && key.toLowerCase() === "a" ? { commands: ["selectAll"] } : {}) });
+        await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...event }); await sleep(80);
+      } else if (action === "scroll") { await evaluate(`scrollBy(0, ${params.dy}), true`); await sleep(200); }
+    });
   }
 }
 
@@ -701,49 +1084,77 @@ canvas{width:100%;display:block;border-radius:8px;box-shadow:0 1px 3px #0002;bac
     message: `${basename(file)}：差异明显的像素占 ${result.overall}%，最多的格子 ${worst.join("、")}${gap}` };
 }
 
+// 外部编码也异步运行，浏览器断开时不会被同步编码挡住。
+function runFfmpeg(args, timeout) {
+  return new Promise((ok) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    encoders.add(child);
+    let stderr = "", done = false;
+    const finish = (status, error) => {
+      if (done) return; done = true; clearTimeout(timer); encoders.delete(child);
+      ok({ status, stderr, error });
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(null, { code: "ETIMEDOUT" });
+      child.stderr.destroy();
+    }, timeout);
+    child.stderr.on("data", (data) => { stderr = (stderr + data).slice(-16384); });
+    child.once("error", (error) => finish(null, error));
+    child.once("close", (code) => finish(code));
+  });
+}
+
 // ---------- 录屏 ----------
-async function record(url, w, h) {
+async function record(url, w, h, { steps = [], name = "", entry = flags.has("entry"), zoom = zooms[0] } = {}) {
+  const video = `record${name ? "-" + name : ""}.mp4`;
+  const motion = `motion${name ? "-" + name : ""}`;
   const frames = [];
-  const dir = join(out, "frames");
-  mkdirSync(dir, { recursive: true });
+  const dir = join(out, name ? `frames-${name}` : "frames");
+  mkdirSync(dir, { recursive: true }); temporaryFrames.add(dir);
   const onFrame = (m) => {
-    if (m.sessionId !== sessionId || m.method !== "Page.screencastFrame") return;
+    if (transportFailure || m.sessionId !== sessionId || m.method !== "Page.screencastFrame") return;
     const name = join(dir, `f${String(frames.length).padStart(4, "0")}.jpg`);
     writeFileSync(name, Buffer.from(m.params.data, "base64"));
     frames.push({ name, t: m.params.metadata.timestamp });
     cdp("Page.screencastFrameAck", { sessionId: m.params.sessionId }).catch(() => {});
   };
-  await setViewport(w, h, zoom);
-  const entry = flags.has("entry");
-  if (!entry) await open(url);
-  listeners.push(onFrame);
-  await cdp("Page.startScreencast", { format: "jpeg", quality: 88, everyNthFrame: 1 });
-  if (entry) {
-    await open(url);
-    // 丢掉页面第一次有内容之前的空白帧，开始帧就是出场的起点
-    const painted = await evaluate(`(() => { const p = performance.getEntriesByName("first-contentful-paint")[0] || performance.getEntriesByType("paint")[0]; return p ? (performance.timeOrigin + p.startTime) / 1000 : 0; })()`);
-    if (painted) { const firstPainted = frames.findIndex((f) => f.t >= painted - 0.02); if (firstPainted > 0) frames.splice(0, firstPainted); }
-  } else await sleep(500);
-  await runSteps(opt.steps);
-  await sleep(Number(opt.hold));
-  const finished = Date.now() / 1000;
-  const issues = await check();
-  await cdp("Page.stopScreencast");
-  listeners.splice(listeners.indexOf(onFrame), 1);
-  if (!frames.length) throw new Error("录屏没有拿到画面");
-  const pick = { start: frames[0], mid: frames[Math.floor(frames.length / 2)], end: frames[frames.length - 1] };
-  for (const [k, f] of Object.entries(pick)) writeFileSync(join(out, `motion-${k}.jpg`), readFileSync(f.name));
-  const ffmpeg = spawnSync("ffmpeg", ["-version"]).status === 0;
-  if (!ffmpeg) return { issues, message: `录屏：没装 ffmpeg，只留了 ${frames.length} 帧和 motion-start/mid/end.jpg` };
-  // Generated basenames are safe for concat's quoting, even when --out contains an apostrophe.
-  // Keep the final still frame through the end of --hold; screencasts only emit changed frames.
-  const list = frames.map((f, i) => `file '${basename(f.name)}'\nduration ${Math.max(0.016, ((frames[i + 1]?.t ?? finished) - f.t)).toFixed(3)}`).join("\n") + `\nfile '${basename(frames.at(-1).name)}'\n`;
-  writeFileSync(join(dir, "list.txt"), list);
-  const r = spawnSync("ffmpeg", ["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", join(dir, "list.txt"),
-    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30", "-pix_fmt", "yuv420p", join(out, "record.mp4")], { encoding: "utf8" });
-  if (r.status !== 0) return { issues, message: `录屏：ffmpeg 合成失败（${r.stderr.trim().split("\n").pop()}），帧留在 frames/` };
-  rmSync(dir, { recursive: true, force: true });
-  return { issues, message: `录屏：record.mp4（${(finished - frames[0].t).toFixed(1)} 秒）和 motion-start/mid/end.jpg` };
+  try {
+    await setViewport(w, h, zoom);
+    if (!entry) await open(url);
+    listeners.push(onFrame);
+    await cdp("Page.startScreencast", { format: "jpeg", quality: 88, everyNthFrame: 1 });
+    if (entry) {
+      await open(url);
+      // 丢掉页面第一次有内容之前的空白帧，开始帧就是出场的起点
+      const painted = await evaluate(`(() => { const p = performance.getEntriesByName("first-contentful-paint")[0] || performance.getEntriesByType("paint")[0]; return p ? (performance.timeOrigin + p.startTime) / 1000 : 0; })()`);
+      if (painted) { const firstPainted = frames.findIndex((f) => f.t >= painted - 0.02); if (firstPainted > 0) frames.splice(0, firstPainted); }
+    } else await sleep(500);
+    await runSteps(steps);
+    await sleep(Number(opt.hold));
+    const finished = Date.now() / 1000;
+    const issues = await check();
+    await cdp("Page.stopScreencast");
+    listeners.splice(listeners.indexOf(onFrame), 1);
+    if (!frames.length) throw new Error("录屏没有拿到画面");
+    const pick = { start: frames[0], mid: frames[Math.floor(frames.length / 2)], end: frames[frames.length - 1] };
+    for (const [k, f] of Object.entries(pick)) writeFileSync(join(out, `${motion}-${k}.jpg`), readFileSync(f.name));
+    const ffmpeg = (await runFfmpeg(["-version"], 5000)).status === 0;
+    if (!ffmpeg) return { issues, failed: true, message: `录屏：没装 ffmpeg，只留了 ${motion}-start/mid/end.jpg 三帧` };
+    // Generated basenames are safe for concat's quoting, even when --out contains an apostrophe.
+    // Keep the final still frame through the end of --hold; screencasts only emit changed frames.
+    const list = frames.map((f, i) => `file '${basename(f.name)}'\nduration ${Math.max(0.016, ((frames[i + 1]?.t ?? finished) - f.t)).toFixed(3)}`).join("\n") + `\nfile '${basename(frames.at(-1).name)}'\n`;
+    writeFileSync(join(dir, "list.txt"), list);
+    const r = await runFfmpeg(["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", join(dir, "list.txt"),
+      "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30", "-pix_fmt", "yuv420p", join(out, video)], 60000);
+    if (r.status !== 0) return { issues, failed: true, message: `录屏：ffmpeg 合成失败（${r.error?.code === "ETIMEDOUT" ? "60 秒内没有合成完成" : r.error?.message || r.stderr.trim().split("\n").pop()}），已保留 ${motion}-start/mid/end.jpg 三帧` };
+    rmSync(dir, { recursive: true, force: true });
+    return { issues, message: `录屏：${video}（${(finished - frames[0].t).toFixed(1)} 秒）和 ${motion}-start/mid/end.jpg` };
+  } finally {
+    const index = listeners.indexOf(onFrame); if (index >= 0) listeners.splice(index, 1);
+    try { if (!transportFailure) await cdp("Page.stopScreencast"); }
+    finally { rmSync(dir, { recursive: true, force: true }); temporaryFrames.delete(dir); }
+  }
 }
 
 
@@ -823,127 +1234,191 @@ const MOTION_PROBE = `(() => {
   };
 })()`;
 
-async function probeMotion(url, w, h) {
+async function probeMotion(url, w, h, steps = []) {
   const { identifier } = await cdp("Page.addScriptToEvaluateOnNewDocument", { source: MOTION_PROBE });
-  problems = [];
-  await setViewport(w, h, 1);
-  await open(url);
-  await sleep(1200);
-  const phases = { load: await evaluate(`__oilMotion.summary("load")`) };
-  if (opt.steps) {
-    await evaluate(`__oilMotion.setPhase("steps"), true`);
-    await runSteps(opt.steps);
-    await sleep(900);
-    phases.steps = await evaluate(`__oilMotion.summary("steps")`);
-  }
-  await evaluate(`(scrollTo(0, 0), __oilMotion.setPhase("hero"), true)`);
-  await sleep(150);
-  const height = await evaluate(`document.documentElement.scrollHeight - innerHeight`);
-  const scrollable = height > 4;
-  const heroEnd = Math.min(height, Math.round(h * 1.5));
-  for (let y = 0; y <= heroEnd; y += Math.round(h / 10)) { await evaluate(`scrollTo(0, ${y}), true`); await sleep(70); }
-  await sleep(400);
-  phases.hero = await evaluate(`__oilMotion.summary("hero")`);
-  await evaluate(`(__oilMotion.setPhase("scroll"), true)`);
-  for (let y = heroEnd; y < height; y += Math.round(h / 4)) { await evaluate(`scrollTo(0, ${y}), true`); await sleep(90); }
-  await evaluate(`scrollTo(0, ${height}), true`);
-  await sleep(600);
-  phases.scroll = await evaluate(`__oilMotion.summary("scroll")`);
-  await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+  try {
+    problems = [];
+    await setViewport(w, h, 1);
+    await open(url);
+    await sleep(1200);
+    const phases = { load: await evaluate(`__oilMotion.summary("load")`) };
+    if (steps.length) {
+      await evaluate(`__oilMotion.setPhase("steps"), true`);
+      await runSteps(steps);
+      await sleep(900);
+      phases.steps = await evaluate(`__oilMotion.summary("steps")`);
+    }
+    await evaluate(`(scrollTo(0, 0), __oilMotion.setPhase("hero"), true)`);
+    await sleep(150);
+    const height = await evaluate(`document.documentElement.scrollHeight - innerHeight`);
+    const scrollable = height > 4;
+    const heroEnd = Math.min(height, Math.round(h * 1.5));
+    for (let y = 0; y <= heroEnd; y += Math.round(h / 10)) { await evaluate(`scrollTo(0, ${y}), true`); await sleep(70); }
+    await sleep(400);
+    phases.hero = await evaluate(`__oilMotion.summary("hero")`);
+    await evaluate(`(__oilMotion.setPhase("scroll"), true)`);
+    for (let y = heroEnd; y < height; y += Math.round(h / 4)) { await evaluate(`scrollTo(0, ${y}), true`); await sleep(90); }
+    await evaluate(`scrollTo(0, ${height}), true`);
+    await sleep(600);
+    phases.scroll = await evaluate(`__oilMotion.summary("scroll")`);
 
-  const issues = [];
-  const names = { load: "首次进入", steps: "--steps 动作", hero: "首屏滚动", scroll: "从头滚到底" };
-  const weak = (p) => p.maxMove < 4 && p.maxSize < 0.02 && p.maxOpacity < 0.3;
-  for (const [k, p] of Object.entries(phases)) {
-    // 首屏景深是可选手法：只报告层数和幅度，供选了它的页面核对，不记为问题。
-    if (k === "hero") {
-      p.layers = p.top.filter((i) => i.size >= 0.05 || i.move >= h * 0.05).length;
-      continue;
+    const issues = [];
+    const names = { load: "首次进入", steps: "--steps 动作", hero: "首屏滚动", scroll: "从头滚到底" };
+    const weak = (p) => p.maxMove < 4 && p.maxSize < 0.02 && p.maxOpacity < 0.3;
+    for (const [k, p] of Object.entries(phases)) {
+      // 首屏景深是可选手法：只报告层数和幅度，供选了它的页面核对，不记为问题。
+      if (k === "hero") {
+        p.layers = p.top.filter((i) => i.size >= 0.05 || i.move >= h * 0.05).length;
+        continue;
+      }
+      if (k === "scroll") {
+        p.scrollable = scrollable;
+        if (!p.elements && scrollable) issues.push("滚动：没有检测到随滚动出现的变化；落地页、品牌页、发布页和展览页需要一段滚动叙事");
+        continue;
+      }
+      if (!p.elements) issues.push(`${names[k]}：没有检测到动画`);
+      else if (p.loops === p.elements) issues.push(`${names[k]}：只有持续循环的动画，没有一次性的${k === "load" ? "出场" : "反馈"}`);
+      else if (weak(p)) issues.push(`${names[k]}：动画幅度太小，看不出来（最大位移 ${p.maxMove}px，尺寸变化 ${(p.maxSize * 100).toFixed(1)}%，透明度变化 ${p.maxOpacity}）`);
     }
-    if (k === "scroll") {
-      p.scrollable = scrollable;
-      if (!p.elements && scrollable) issues.push("滚动：没有检测到随滚动出现的变化；落地页、品牌页、发布页和展览页需要一段滚动叙事");
-      continue;
-    }
-    if (!p.elements) issues.push(`${names[k]}：没有检测到动画`);
-    else if (p.loops === p.elements) issues.push(`${names[k]}：只有持续循环的动画，没有一次性的${k === "load" ? "出场" : "反馈"}`);
-    else if (weak(p)) issues.push(`${names[k]}：动画幅度太小，看不出来（最大位移 ${p.maxMove}px，尺寸变化 ${(p.maxSize * 100).toFixed(1)}%，透明度变化 ${p.maxOpacity}）`);
-  }
-  const brief = (k, p) => k === "scroll" && !p.scrollable ? "页面不滚动，跳过滚动检查" : k === "hero" ? `首屏滚动 ${p.layers} 层在变，最大缩放 ${(p.maxSize * 100).toFixed(1)}%，最大位移 ${p.maxMove}px`
-    : `${names[k]} ${p.elements} 个元素在动，最大位移 ${p.maxMove}px，透明度变化 ${p.maxOpacity}`;
-  return { phases, issues: [...problems, ...issues], message: "动效探测：" + Object.entries(phases).map(([k, p]) => brief(k, p)).join("；") };
+    const brief = (k, p) => k === "scroll" && !p.scrollable ? "页面不滚动，跳过滚动检查" : k === "hero" ? `首屏滚动 ${p.layers} 层在变，最大缩放 ${(p.maxSize * 100).toFixed(1)}%，最大位移 ${p.maxMove}px`
+      : `${names[k]} ${p.elements} 个元素在动，最大位移 ${p.maxMove}px，透明度变化 ${p.maxOpacity}`;
+    return { phases, issues: [...problems, ...issues], message: "动效探测：" + Object.entries(phases).map(([k, p]) => brief(k, p)).join("；") };
+  } finally { await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier }); }
 }
 
 // ---------- 主流程 ----------
 const base = await resolveTarget(target);
 const withState = (s) => {
-  if (!s) return base;
   const u = new URL(base);
-  u.searchParams.set(opt.param, s);
+  for (const [key, value] of new URLSearchParams(opt.query || "")) u.searchParams.set(key, value);
+  if (s) u.searchParams.set(opt.param, s);
   return u.toString();
 };
-const report = [];
-const lines = [];
-try {
-  if (flags.has("motion")) {
-    const result = await probeMotion(withState(states[0]), sizes[0].w, sizes[0].h);
-    lines.push(result.message + (result.issues.length ? "  ⚠ " + result.issues.join("；") : ""));
-    report.push({ file: "motion-probe", state: states[0], size: `${sizes[0].w}x${sizes[0].h}`, zoom: 1, motion: result.phases, issues: result.issues });
+const report = [], lines = [];
+const usedFiles = new Set();
+function reserveFamily(preferred, files) {
+  let name = preferred, n = 2;
+  while (files(name).some((file) => usedFiles.has(file))) name = `${preferred ? preferred + "-" : ""}${n++}`;
+  files(name).forEach((file) => usedFiles.add(file));
+  if (name !== preferred) notices.push(`文件名冲突，已区分：${files(preferred)[0]} → ${files(name)[0]}`);
+  return name;
+}
+saveFatalReport = (error) => {
+  report.push({ file: "browser", failed: true, issues: [...problems, error.message] });
+  writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
+};
+const evidence = flags.has("evidence");
+// Evidence failures belong to individual items, so later items can still run.
+async function item(file, metadata, work) {
+  try { await during(file, work); }
+  catch (error) {
+    if (transportFailure) throw error;
+    report.push({ file, ...metadata, failed: true, issues: [...problems, error.message] });
+    if (!evidence) throw error;
+    lines.push(`${file}  ⚠ 失败：${error.message}`); process.exitCode = 1;
   }
-  if (flags.has("record")) {
-    const result = await record(withState(states[0]), sizes[0].w, sizes[0].h);
-    lines.push(result.message);
-    report.push({ file: "motion-end.jpg", state: states[0], size: `${sizes[0].w}x${sizes[0].h}`, zoom, issues: result.issues });
-  } else {
-    for (const { w, h } of sizes) {
-      const shots = [], masked = [];
-      for (const [stateIndex, s] of states.entries()) {
+}
+async function captureBatch(selectedStates, selectedZooms, selectedGroups, useMask, useSheet) {
+  for (const { w, h } of sizes) for (const zoom of selectedZooms) for (const group of selectedGroups) {
+    const shots = [], masked = [];
+    const suffix = [group.id, sizes.length > 1 ? `${w}x${h}` : "", zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean).join("-");
+    for (const stateIndex of selectedStates) {
+      const state = states[stateIndex];
+      const preferred = [stateIds[stateIndex], suffix].filter(Boolean).join("-");
+      const name = reserveFamily(preferred, (stem) => [`${stem}.png`, ...(useMask ? [`${stem}-masked.png`] : []), ...(marks.length ? [`${stem}-marked.png`] : []), ...(refImage ? [`${stem}-compare.png`] : [])]);
+      const meta = { state, size: `${w}x${h}`, zoom, ...(group.id ? { group: group.id } : {}) };
+      await item(`${name}.png`, meta, async () => {
         problems = [];
-        await setViewport(w, h, zoom);
-        await open(withState(s));
-        if (opt.steps) await runSteps(opt.steps);
-        const name = [stateIds[stateIndex], sizes.length > 1 ? `${w}x${h}` : "", zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean).join("-");
+        await setViewport(w, h, zoom); await open(withState(state));
+        let animationWaitMs = await settleAnimations(2000);
+        await runSteps(group.steps);
+        animationWaitMs += await settleAnimations(2000 - animationWaitMs);
         const file = await screenshot(join(out, `${name}.png`), flags.has("full"));
-        const issues = await check();
-        const hints = await lint();
-        const entry = { file: basename(file), state: s, size: `${w}x${h}`, zoom, issues, lint: hints };
-        report.push(entry);
-        shots.push({ path: file, label: s || "page" });
+        const issues = await check(), hints = await lint();
+        const entry = { file: basename(file), ...meta, animationWaitMs, issues, lint: hints };
+        report.push(entry); shots.push({ path: file, label: state || "page" });
         lines.push(`${basename(file)}${issues.length ? "  ⚠ " + issues.join("；") : ""}${hints.length ? "  ◇ 默认做法提示：" + lintLine(hints) : ""}`);
-        if (marks.length) {
-          await mark();
-          lines.push(basename(await screenshot(join(out, `${name}-marked.png`), flags.has("full"))));
-          await unmark();
-        }
-        if (flags.has("mask")) {
-          await mask();
-          await sleep(60);
-          masked.push({ path: await screenshot(join(out, `${name}-masked.png`), flags.has("full")), label: s || "page" });
-        }
+        if (marks.length) await item(`${name}-marked.png`, meta, async () => {
+          try { await mark(); lines.push(basename(await screenshot(join(out, `${name}-marked.png`), flags.has("full")))); }
+          finally { await unmark(); }
+        });
+        if (useMask) await item(`${name}-masked.png`, meta, async () => {
+          try {
+            await mask(); await sleep(60);
+            masked.push({ path: await screenshot(join(out, `${name}-masked.png`), flags.has("full")), label: state || "page" });
+            lines.push(`${name}-masked.png`);
+          } finally { await evaluate(`(document.getElementById("oil-mask")?.remove(), true)`); }
+        });
         if (refImage) {
           const result = await compare(file, refImage, join(out, `${name}-compare.png`));
-          entry.compare = { file: result.file, overall: result.overall, cells: result.cells };
-          lines.push(result.message);
+          entry.compare = { file: result.file, overall: result.overall, cells: result.cells }; lines.push(result.message);
         }
-      }
-      if (flags.has("sheet") && shots.length > 1) {
-        const suffix = sizes.length > 1 ? `-${w}x${h}` : "";
-        lines.push(basename(await sheet(shots, join(out, `sheet${suffix}.png`), w, h)));
-        if (masked.length) lines.push(basename(await sheet(masked, join(out, `sheet${suffix}-masked.png`), w, h)));
-      }
+      });
+    }
+    if (useSheet && shots.length > 1) {
+      const sheetSuffixParts = [group.id, sizes.length > 1 ? `${w}x${h}` : "", selectedZooms.length > 1 && zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean);
+      const preferred = `sheet${sheetSuffixParts.length ? "-" + sheetSuffixParts.join("-") : ""}`;
+      const sheetName = reserveFamily(preferred, (stem) => [`${stem}.png`, ...(masked.length > 1 ? [`${stem}-masked.png`] : [])]);
+      await item(`${sheetName}.png`, { size: `${w}x${h}`, zoom }, async () => {
+        lines.push(basename(await sheet(shots, join(out, `${sheetName}.png`), w, h)));
+      });
+      if (masked.length > 1) await item(`${sheetName}-masked.png`, { size: `${w}x${h}`, zoom }, async () => {
+        lines.push(basename(await sheet(masked, join(out, `${sheetName}-masked.png`), w, h)));
+      });
     }
   }
-  writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
-} catch (error) {
-  console.error(`shoot：${error.message}`);
-  process.exitCode = 1;
 }
+async function motionBatch() {
+  for (const group of groups.length ? groups : [{ id: "", steps: [] }]) {
+    const file = `motion-probe${group.id ? "-" + group.id : ""}`;
+    const meta = { state: states[0], size: `${sizes[0].w}x${sizes[0].h}`, zoom: 1, ...(group.id ? { group: group.id } : {}) };
+    await item(file, meta, async () => {
+      const result = await probeMotion(withState(states[0]), sizes[0].w, sizes[0].h, group.steps);
+      lines.push(result.message + (result.issues.length ? "  ⚠ " + result.issues.join("；") : ""));
+      report.push({ file, ...meta, motion: result.phases, issues: result.issues });
+    });
+  }
+}
+async function recording(group, entry, zoom, multipleZooms = false) {
+  const preferred = [group.id, multipleZooms && zoom !== 1 ? `@${zoom}x` : ""].filter(Boolean).join("-");
+  const name = reserveFamily(preferred, (stem) => [`record${stem ? "-" + stem : ""}.mp4`, ...["start", "mid", "end"].map((frame) => `motion${stem ? "-" + stem : ""}-${frame}.jpg`)]);
+  const file = `motion${name ? "-" + name : ""}-end.jpg`;
+  const meta = { state: states[0], size: `${sizes[0].w}x${sizes[0].h}`, zoom, ...(group.id ? { group: group.id } : {}) };
+  await item(file, meta, async () => {
+    problems = [];
+    const result = await record(withState(states[0]), sizes[0].w, sizes[0].h, { name, steps: group.steps, entry, zoom });
+    lines.push(result.message);
+    report.push({ file, ...meta, issues: result.issues, ...(result.failed ? { failed: true } : {}) });
+    if (evidence && result.failed) { report.at(-1).issues.push(result.message); process.exitCode = 1; }
+  });
+}
+try {
+  if (evidence) {
+    const plain = [{ id: "", steps: [] }];
+    await captureBatch(states.map((_, i) => i), [1], plain, states.length > 1 || flags.has("mask"), states.length > 1);
+    await captureBatch([0], [2], plain, flags.has("mask"), false);
+    await motionBatch();
+    // Avoid collisions with a user group named entry.
+    let entryId = "entry";
+    while (groups.some((g) => g.id === entryId)) entryId += "-appearance";
+    await recording({ id: entryId, steps: [] }, true, 1);
+    for (const group of groups) await recording(group, false, 1);
+  } else {
+    if (flags.has("motion")) await motionBatch();
+    if (flags.has("record")) {
+      for (const zoom of zooms) for (const group of groups.length ? groups : [{ id: "", steps: [] }]) await recording(group, flags.has("entry"), zoom, zooms.length > 1);
+    } else await captureBatch(states.map((_, i) => i), zooms, groups.length ? groups : [{ id: "", steps: [] }], flags.has("mask"), flags.has("sheet"));
+  }
+} catch (error) { if (!transportFailure) console.error(`shoot：${error.message}`); process.exitCode = 1; }
+writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2));
 console.log(`输出目录：${out}`);
+for (const notice of notices) console.log(`- ${notice}`);
 for (const l of lines) console.log(`- ${l}`);
 const total = report.reduce((n, r) => n + r.issues.length, 0);
 if (report.length) console.log(total ? `发现 ${total} 个问题，详见 report.json` : `检查通过：没有控制台错误、横向溢出或加载失败的图片${flags.has("motion") ? "，三段动效都检测到了" : ""}`);
 const hinted = [...new Set(report.flatMap((r) => (r.lint || []).map((i) => i.label)))];
 if (hinted.length) console.log(`默认做法提示 ${hinted.length} 类：${hinted.join("、")}。可读性几项（对比度不达标、正文小于 13px、行高过紧、停在透明）要改；其余改掉，或在交付说明里写出它怎样服务方向，误报也写一句。详见 report.json 的 lint`);
+finishing = true;
 ws.close();
 await cleanup();
 process.exit(process.exitCode || 0);

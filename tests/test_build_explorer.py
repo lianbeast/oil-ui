@@ -563,5 +563,57 @@ finally{clearTimeout(deadline);chrome.kill();}
         self.assertTrue(self.output.is_file())
 
 
+    def test_every_manifest_problem_is_reported_in_one_pass(self):
+        self.data["schemaVersion"] = 2
+        self.data["candidates"][0].update(id="A", palette=["red", "#fff"], source="missing.html")
+        self.data["candidates"].append({"id": "b", "concept": "c", "typography": "t", "palette": ["#123456"], "traits": [], "kind": "pdf"})
+        self.save()
+        with self.assertRaises(builder.ManifestError) as caught:
+            builder.build(self.manifest, self.output)
+        text = str(caught.exception)
+        self.assertGreaterEqual(len(caught.exception.problems), 6)
+        for expected in ("schemaVersion", '候选 id "A" 无效', "missing.html", "red", 'kind 只能是', "候选 b：name", "候选 b：traits"):
+            self.assertIn(expected, text)
+        self.assertNotIn("#fff", text)
+        self.assertFalse(self.output.exists())
+
+    def test_single_problem_reads_as_one_sentence(self):
+        self.data["candidates"][0]["palette"] = ["blue"]
+        self.save()
+        with self.assertRaises(ValueError) as caught:
+            builder.build(self.manifest, self.output)
+        self.assertNotIn("处要改", str(caught.exception))
+        self.assertIn("候选 a：palette", str(caught.exception))
+
+    def test_output_defaults_to_a_file_beside_the_manifest(self):
+        run = subprocess.run([sys.executable, str(ROOT / "scripts" / "build_explorer.py"), str(self.manifest)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        expected = self.folder.resolve() / "style-explorer.html"
+        self.assertEqual(Path(json.loads(run.stdout)["output"]), expected)
+        self.assertTrue(expected.is_file())
+        again = subprocess.run([sys.executable, str(ROOT / "scripts" / "build_explorer.py"), str(self.manifest)], capture_output=True, text=True)
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("--force", again.stderr)
+
+    def test_missing_and_malformed_manifests_say_what_to_do(self):
+        script = str(ROOT / "scripts" / "build_explorer.py")
+        missing = subprocess.run([sys.executable, script, str(self.folder / "nope.json")], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("找不到 manifest", missing.stderr)
+        self.assertNotIn("Errno", missing.stderr)
+        broken = self.folder / "broken.json"
+        broken.write_text('{"schemaVersion": 1,', encoding="utf-8")
+        malformed = subprocess.run([sys.executable, script, str(broken)], capture_output=True, text=True)
+        self.assertEqual(malformed.returncode, 1)
+        self.assertRegex(malformed.stderr, r"不是合法的 JSON：第 \d+ 行第 \d+ 列")
+        self.assertNotIn("Traceback", malformed.stderr)
+
+    def test_help_shows_a_complete_example(self):
+        run = subprocess.run([sys.executable, str(ROOT / "scripts" / "build_explorer.py"), "--help"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0)
+        for expected in ("manifest.json", '"schemaVersion": 1', "--force", "style-explorer.html"):
+            self.assertIn(expected, run.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

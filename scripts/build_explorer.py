@@ -26,19 +26,30 @@ PREVIEW_CSP = (
 )
 
 
-def text_field(obj: dict, name: str, *, default: str | None = None) -> str:
+class ManifestError(ValueError):
+    """Every problem found in one pass, so the manifest can be fixed in one edit."""
+
+    def __init__(self, problems: list[str]):
+        self.problems = problems
+        if len(problems) == 1:
+            super().__init__(problems[0])
+        else:
+            super().__init__(f"manifest 有 {len(problems)} 处要改：\n" + "\n".join(f"  {i}. {p}" for i, p in enumerate(problems, 1)))
+
+
+def text_field(obj: dict, name: str, *, default: str | None = None, where: str = "") -> str:
     value = obj.get(name, default)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{name} 必须是非空字符串")
+        raise ValueError(f"{where}{name} 必须是非空字符串")
     return value.strip()
 
 
-def text_list(obj: dict, name: str) -> list[str]:
+def text_list(obj: dict, name: str, *, where: str = "") -> list[str]:
     values = obj.get(name)
     if not isinstance(values, list) or not values:
-        raise ValueError(f"{name} 必须是非空字符串数组")
+        raise ValueError(f"{where}{name} 必须是非空字符串数组")
     if any(not isinstance(v, str) or not v.strip() for v in values):
-        raise ValueError(f"{name} 的每项必须是非空字符串")
+        raise ValueError(f"{where}{name} 的每项必须是非空字符串")
     return [v.strip() for v in values]
 
 
@@ -266,85 +277,147 @@ def prepare_image(path: Path) -> str:
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 
-def local_url(value: str, identifier: str) -> str:
+def local_url(value: str, label: str) -> str:
     """Live candidates only point at a dev server on this machine."""
     try:
         parts = urlsplit(value)
         parts.port  # Reject malformed ports before generating CSP origins.
     except ValueError:
-        raise ValueError(f"{identifier}: url 必须是有效的本机 http(s) 地址") from None
+        raise ValueError(f"{label}必须是有效的本机 http(s) 地址，收到的是 {value}") from None
     if parts.scheme not in ("http", "https") or (parts.hostname or "").lower() not in LOOPBACK or parts.username or parts.password:
-        raise ValueError(f"{identifier}: url 只能是本机开发服务器地址，例如 http://localhost:5173/orders")
+        raise ValueError(f"{label}只能是本机开发服务器地址，例如 http://localhost:5173/orders；收到的是 {value}")
     return value
 
 
+HEX_COLOR = re.compile(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})")
+
+
+def read_manifest(path: Path) -> dict:
+    if not path.is_file():
+        raise ValueError(f"找不到 manifest：{path}。先在任务目录里写好 manifest.json，字段见 references/style-explorer.md 的“准备输入”")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"manifest 不是合法的 JSON：第 {exc.lineno} 行第 {exc.colno} 列，{exc.msg}") from None
+    if not isinstance(raw, dict):
+        raise ValueError("manifest 的最外层必须是一个对象，里面有 schemaVersion、project、brief 和 candidates")
+    return raw
+
+
 def load_manifest(path: Path) -> tuple[dict, set[Path]]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
-        raise ValueError("manifest.schemaVersion 必须为 1")
-    data = {"schemaVersion": 1, "project": text_field(raw, "project"),
-            "brief": text_field(raw, "brief"), "round": text_field(raw, "round", default="01")}
+    raw = read_manifest(path)
+    problems: list[str] = []
+
+    def attempt(check):
+        """Run one check; keep its message and carry on so the rest still gets checked."""
+        try:
+            return check()
+        except ValueError as exc:
+            problems.append(str(exc))
+            return None
+
+    if raw.get("schemaVersion") != 1:
+        problems.append("manifest.schemaVersion 必须为 1")
+    data = {"schemaVersion": 1}
+    for name, default in (("project", None), ("brief", None), ("round", "01")):
+        data[name] = attempt(lambda: text_field(raw, name, default=default, where="manifest."))
     if "lang" in raw:
         if raw["lang"] not in ("zh", "en"):
-            raise ValueError('manifest.lang 只能是 "zh" 或 "en"')
+            problems.append('manifest.lang 只能是 "zh" 或 "en"')
         data["lang"] = raw["lang"]
     if "serve" in raw:
         serve = raw["serve"]
         if not isinstance(serve, dict):
-            raise ValueError("serve 必须是对象")
-        if not isinstance(serve.get("command"), str) or not serve["command"].strip():
-            raise ValueError("serve.command 必须是非空字符串")
-        if "cwd" in serve and (not isinstance(serve["cwd"], str) or not Path(serve["cwd"]).is_absolute()):
-            raise ValueError("serve.cwd 必须是绝对路径")
-        if "url" in serve:
-            if not isinstance(serve["url"], str) or not serve["url"].strip():
-                raise ValueError("serve.url 必须是非空的本机 http(s) 地址")
-            local_url(serve["url"], "serve")
+            problems.append("serve 必须是对象，例如 {\"command\": \"pnpm dev\", \"cwd\": \"/项目的绝对路径\", \"url\": \"http://localhost:3000\"}")
+        else:
+            if not isinstance(serve.get("command"), str) or not serve["command"].strip():
+                problems.append("serve.command 必须是非空字符串")
+            if "cwd" in serve and (not isinstance(serve["cwd"], str) or not Path(serve["cwd"]).is_absolute()):
+                problems.append("serve.cwd 必须是绝对路径")
+            if "url" in serve:
+                if not isinstance(serve["url"], str) or not serve["url"].strip():
+                    problems.append("serve.url 必须是非空的本机 http(s) 地址")
+                else:
+                    attempt(lambda: local_url(serve["url"], "serve.url "))
         data["serve"] = serve
     candidates = raw.get("candidates")
     if not isinstance(candidates, list) or not candidates:
-        raise ValueError("candidates 至少需要一个候选")
+        problems.append("candidates 至少需要一个候选")
+        candidates = []
     seen = set()
     inputs = {path, TEMPLATE.resolve()}
     output = []
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates, 1):
         if not isinstance(candidate, dict):
-            raise ValueError("每个候选必须是对象")
-        identifier = text_field(candidate, "id")
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", identifier) or identifier in seen:
-            raise ValueError(f"候选 id 无效或重复: {identifier}")
-        seen.add(identifier)
+            problems.append(f"第 {index} 个候选必须是对象")
+            continue
+        before = len(problems)
+        identifier = candidate.get("id")
+        if not isinstance(identifier, str) or not identifier.strip():
+            problems.append(f"第 {index} 个候选缺少 id")
+            identifier = None
+        else:
+            identifier = identifier.strip()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", identifier):
+                problems.append(f'候选 id "{identifier}" 无效：只用小写字母、数字、连字符和下划线，以字母或数字开头，例如 "a" 或 "dir-2"')
+            elif identifier in seen:
+                problems.append(f'候选 id "{identifier}" 重复了，每个候选要用不同的 id')
+            seen.add(identifier)
+        where = f"候选 {identifier}：" if identifier else f"第 {index} 个候选："
         kind = candidate.get("kind", "html")
         if kind not in ("html", "image", "url"):
-            raise ValueError(f"未知候选 kind: {kind}")
+            problems.append(f'{where}kind 只能是 "html"、"image" 或 "url"，收到的是 {json.dumps(kind, ensure_ascii=False)}')
+            kind = None
         baseline = candidate.get("baseline", False)
         interactive = candidate.get("interactive", False)
         if not isinstance(baseline, bool) or not isinstance(interactive, bool):
-            raise ValueError(f"{identifier}: baseline 和 interactive 必须是 true 或 false")
-        if interactive and kind != "html":
-            raise ValueError(f"{identifier}: interactive 只用于 html 候选")
+            problems.append(f"{where}baseline 和 interactive 必须是 true 或 false")
+        elif interactive and kind not in ("html", None):
+            problems.append(f"{where}interactive 只用于 html 候选")
+        source = url = None
         if kind == "url":
-            source = None
-            url = local_url(text_field(candidate, "url"), identifier)
-        else:
-            source = (path.parent / text_field(candidate, "source")).resolve()
-            if not source.is_relative_to(path.parent) or not source.is_file():
-                raise ValueError(f"候选 source 必须是 manifest 目录内可读文件: {identifier}")
-            inputs.add(source)
-        colors = text_list(candidate, "palette")
-        if any(not re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", c) for c in colors):
-            raise ValueError(f"{identifier}: palette 需要十六进制颜色")
+            url = attempt(lambda: local_url(text_field(candidate, "url", where=where), f"{where}url "))
+        elif kind:
+            name = attempt(lambda: text_field(candidate, "source", where=where))
+            if name:
+                source = (path.parent / name).resolve()
+                if not source.is_relative_to(path.parent):
+                    problems.append(f"{where}source 必须在 manifest 所在的目录里，收到的是 {name}")
+                    source = None
+                elif not source.is_file():
+                    problems.append(f"{where}找不到 source 文件 {name}（按 manifest 所在的目录 {path.parent} 找）")
+                    source = None
+                else:
+                    inputs.add(source)
+        colors = attempt(lambda: text_list(candidate, "palette", where=where))
+        if colors:
+            wrong = [c for c in colors if not HEX_COLOR.fullmatch(c)]
+            if wrong:
+                problems.append(f'{where}palette 要写十六进制颜色，例如 "#1a2b3c"；这几项不是：{"、".join(wrong)}')
+        texts = {name: attempt(lambda: text_field(candidate, name, where=where)) for name in ("name", "concept", "typography")}
+        traits = attempt(lambda: text_list(candidate, "traits", where=where))
+        if len(problems) > before:
+            continue
+        try:
+            content = url if kind == "url" else prepare_html(source, interactive, path.parent, inputs) if kind == "html" else prepare_image(source)
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith(f"{source.name}: "):
+                message = message[len(source.name) + 2:]
+            problems.append(f"{where}{source.name} {message}" if source else f"{where}{message}")
+            continue
         output.append({
-            "id": identifier,
-            **{name: text_field(candidate, name) for name in ("name", "concept", "typography")},
-            "palette": colors, "traits": text_list(candidate, "traits"), "kind": kind,
-            "content": url if kind == "url" else prepare_html(source, interactive, path.parent, inputs) if kind == "html" else prepare_image(source),
+            "id": identifier, **texts,
+            "palette": colors, "traits": traits, "kind": kind,
+            "content": content,
             "sourceLabel": url if kind == "url" else source.name,
             "baseline": baseline,
             "interactive": interactive,
         })
     if sum(c["baseline"] for c in output) > 1:
-        raise ValueError("最多只能有一个基线候选")
+        problems.append("最多只能有一个基线候选（baseline: true）")
+    if problems:
+        raise ManifestError(problems)
     # The current version always sits first so every direction is read against it.
     output.sort(key=lambda c: not c["baseline"])
     data["candidates"] = output
@@ -359,7 +432,7 @@ def build(manifest: Path, output: Path, *, force: bool = False) -> dict:
     if output in inputs or output.is_relative_to(SKILL_ROOT):
         raise ValueError("输出不能覆盖输入或写进 Skill 安装目录")
     if output.exists() and not force:
-        raise FileExistsError("输出已存在；使用新路径，或明确加 --force 更新")
+        raise FileExistsError(f"输出已存在：{output}。要更新它就加 --force，要保留它就用 --output 换一个路径")
     template = embed_local_files(TEMPLATE.read_text(encoding="utf-8"), TEMPLATE.parent, SKILL_ROOT, inputs)
     skill_file = SKILL_ROOT / "SKILL.md"
     skill = skill_file.read_text(encoding="utf-8") if skill_file.is_file() else ""
@@ -399,17 +472,36 @@ def build(manifest: Path, output: Path, *, force: bool = False) -> dict:
     return {"output": str(output), "candidates": len(data["candidates"]), "fingerprint": data["fingerprint"], "bytes": output.stat().st_size}
 
 
-def main() -> int:
+HELP_EPILOG = """\
+用法示例：
+  python3 build_explorer.py <任务目录>/manifest.json
+      生成 <任务目录>/style-explorer.html；已有同名文件时加 --force 覆盖。
+
+manifest.json 最少要有：
+  {"schemaVersion": 1, "project": "<项目名>", "brief": "<所有候选共同的内容与任务>",
+   "candidates": [{"id": "a", "name": "<方向名>", "concept": "<一句体验意图>",
+     "typography": "<实际使用的字体关系>", "palette": ["#112233", "#f5f5f5"],
+     "traits": ["<看得见的特征>"], "kind": "html", "source": "a.html"}]}
+  kind 还可以是 "image"（source 指向 PNG、JPEG 或 WebP）或 "url"（用 url 字段指向本机开发服务器）。
+  全部字段见 references/style-explorer.md 的“准备输入”。
+
+写错时会把 manifest 里所有要改的地方一次列出来，旧的对比页不会被改动。
+成功时在标准输出打印一行 JSON：output、candidates、fingerprint、bytes。"""
+
+
+def main(argv: list[str] | None = None) -> int:
     if sys.version_info < (3, 10):
         print("需要 Python 3.10 或更新版本", file=sys.stderr)
         return 2
-    parser = argparse.ArgumentParser(description="把本地候选与 manifest 组装成独立风格对比 HTML")
-    parser.add_argument("manifest", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--force", action="store_true", help="明确允许原子更新已有输出")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="把 manifest 里列出的候选页面组装成一个可以离线打开的风格对比页",
+                                     epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("manifest", type=Path, help="manifest.json 的路径，候选文件和它放在同一个目录或子目录里")
+    parser.add_argument("--output", type=Path, help="输出的 HTML 路径；不写时是 manifest 旁边的 style-explorer.html")
+    parser.add_argument("--force", action="store_true", help="输出文件已经存在时覆盖它")
+    args = parser.parse_args(argv)
+    output = args.output or args.manifest.resolve().parent / "style-explorer.html"
     try:
-        print(json.dumps(build(args.manifest, args.output, force=args.force), ensure_ascii=False))
+        print(json.dumps(build(args.manifest, output, force=args.force), ensure_ascii=False))
         return 0
     except (OSError, ValueError, TypeError) as exc:
         print(f"未生成对比页：{exc}", file=sys.stderr)
